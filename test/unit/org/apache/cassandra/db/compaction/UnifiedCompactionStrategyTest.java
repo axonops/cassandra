@@ -821,6 +821,83 @@ public class UnifiedCompactionStrategyTest
         }
     }
 
+    @Test
+    public void testTinyNearPointCoverageSSTablesAreEventuallyCompacted()
+    {
+        // Repair streams produce sstables holding a handful of adjacent keys. Their token span is
+        // far below any shard's, but above ShardManager.MINIMUM_TOKEN_COVERAGE, so their density
+        // (size / span) is orders of magnitude higher than any real sstable's and they are placed
+        // on high, otherwise empty levels where no overlap set of size >= 2 can form. Background
+        // selection must still consume them eventually (CASSANDRA-TBD).
+        Controller controller = Mockito.mock(Controller.class);
+        long minimalSizeBytes = 4 << 20;
+        when(controller.getScalingParameter(anyInt())).thenReturn(2); // T4: F=4, T=4
+        when(controller.getFanout(anyInt())).thenCallRealMethod();
+        when(controller.getThreshold(anyInt())).thenCallRealMethod();
+        when(controller.getMaxLevelDensity(anyInt(), anyDouble())).thenCallRealMethod();
+        when(controller.getSurvivalFactor(anyInt())).thenReturn(1.0);
+        when(controller.getNumShards(anyDouble())).thenReturn(1);
+        when(controller.getBaseSstableSize(anyInt())).thenReturn((double) minimalSizeBytes);
+        when(controller.maxConcurrentCompactions()).thenReturn(1000);
+        when(controller.maxThroughput()).thenReturn(Double.MAX_VALUE);
+        when(controller.maxSSTablesToCompact()).thenReturn(64);
+        when(controller.overlapInclusionMethod()).thenReturn(Overlaps.InclusionMethod.TRANSITIVE);
+        Random randomMock = Mockito.mock(Random.class);
+        when(randomMock.nextInt(anyInt())).thenReturn(0);
+        when(controller.random()).thenReturn(randomMock);
+
+        UnifiedCompactionStrategy strategy = new UnifiedCompactionStrategy(cfs, new HashMap<>(), controller);
+
+        Token min = partitioner.getMinimumToken();
+        Token max = partitioner.getMaximumToken();
+        ByteBuffer emptyBuffer = ByteBuffer.allocate(0);
+        long timestamp = System.currentTimeMillis();
+
+        // A handful of realistic sstables covering the whole local range, as flushes produce.
+        List<SSTableReader> wide = new ArrayList<>();
+        for (int i = 0; i < 4; i++)
+        {
+            DecoratedKey first = new BufferDecoratedKey(partitioner.split(min, max, 0.001).nextValidToken(), emptyBuffer);
+            DecoratedKey last = new BufferDecoratedKey(max, emptyBuffer);
+            wide.add(mockSSTable(0, minimalSizeBytes, timestamp + i, 0.0, first, last));
+        }
+
+        // Tiny sstables of a few hundred bytes whose spans match repair-streamed files observed in
+        // the field: ~1e-11 of the token space, mutually disjoint, scattered across the range.
+        final int tinyCount = 16;
+        final double tinySpan = 1e-11;
+        List<SSTableReader> tiny = new ArrayList<>();
+        for (int i = 0; i < tinyCount; i++)
+        {
+            double position = (i + 1) / (double) (tinyCount + 1);
+            DecoratedKey first = new BufferDecoratedKey(partitioner.split(min, max, position), emptyBuffer);
+            DecoratedKey last = new BufferDecoratedKey(partitioner.split(min, max, position + tinySpan), emptyBuffer);
+            tiny.add(mockSSTable(0, 256 + 128 * i, timestamp + 100 + i, 0.0, first, last));
+        }
+
+        strategy.addSSTables(wide);
+        strategy.addSSTables(tiny);
+        dataTracker.addInitialSSTables(wide);
+        dataTracker.addInitialSSTables(tiny);
+
+        // Apply background picks until the strategy runs dry, treating each pick as compacted away.
+        Set<SSTableReader> compacted = new HashSet<>();
+        for (int iterations = 0; iterations < 100; iterations++)
+        {
+            UnifiedCompactionStrategy.CompactionPick pick = strategy.getNextCompactionPick(0);
+            if (pick == null)
+                break;
+            compacted.addAll(pick);
+            strategy.removeSSTables(pick);
+        }
+
+        List<SSTableReader> missed = new ArrayList<>(tiny);
+        missed.removeAll(compacted);
+        assertTrue("Background selection never consumed " + missed.size() + " of " + tinyCount +
+                   " tiny near-point-coverage sstables: " + missed,
+                   missed.isEmpty());
+    }
+
     SSTableReader mockSSTable(int level, long bytesOnDisk, long timestamp, double hotness, DecoratedKey first, DecoratedKey last)
     {
         return mockSSTable(level, bytesOnDisk, timestamp, hotness, first, last, 0);
