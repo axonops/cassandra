@@ -29,6 +29,7 @@ import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+
 import org.junit.Test;
 
 import org.slf4j.LoggerFactory;
@@ -42,8 +43,8 @@ import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.progress.ProgressEventType;
 import org.apache.cassandra.utils.concurrent.Condition;
+import org.apache.cassandra.utils.progress.ProgressEventType;
 import org.hamcrest.Matchers;
 
 import static org.apache.cassandra.cql3.TombstonesWithIndexedSSTableTest.makeRandomString;
@@ -241,7 +242,7 @@ public class UnifiedCompactionDensitiesTest extends TestBaseImpl
                 if (event.getType() == ProgressEventType.COMPLETE)
                     await.signalAll();
             })).right.get();
-            await.await(1L, TimeUnit.MINUTES);
+            assertTrue("Repair did not complete within timeout", await.await(1L, TimeUnit.MINUTES));
         }));
     }
 
