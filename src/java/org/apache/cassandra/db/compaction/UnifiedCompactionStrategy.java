@@ -21,6 +21,7 @@ package org.apache.cassandra.db.compaction;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -458,18 +459,34 @@ public class UnifiedCompactionStrategy extends AbstractCompactionStrategy
         return formLevels(suitable);
     }
 
+    /**
+     * The density used to assign an sstable to a level. SSTables below the controller's minimum size for density
+     * levelling cover too little of the token space for density tiering to be meaningful (e.g. repair streams
+     * containing a small replica difference, which would otherwise map to a density above any compacted sstable's
+     * and be stranded on high levels whose overlap threshold they can never reach); they are levelled by their raw
+     * size instead, which corresponds to a full-token-range span and places them on level 0, where they overlap
+     * newly-flushed sstables and are compacted normally. See CASSANDRA-21615.
+     */
+    private double levellingDensity(SSTableReader rdr)
+    {
+        long onDiskLength = rdr.onDiskLength();
+        if (onDiskLength < controller.getMinSizeForDensityLevelling())
+            return onDiskLength;
+        return shardManager.density(rdr);
+    }
+
     private List<Level> formLevels(List<SSTableReader> suitable)
     {
         maybeUpdateShardManager();
         List<Level> levels = new ArrayList<>(MAX_LEVELS);
-        suitable.sort(shardManager::compareByDensity);
+        suitable.sort(Comparator.comparingDouble(this::levellingDensity));
 
         double maxDensity = controller.getMaxLevelDensity(0, controller.getBaseSstableSize(controller.getFanout(0)) / shardManager.localSpaceCoverage());
         int index = 0;
         Level level = new Level(controller, index, 0, maxDensity);
         for (SSTableReader candidate : suitable)
         {
-            final double density = shardManager.density(candidate);
+            final double density = levellingDensity(candidate);
             if (density < level.max)
             {
                 level.add(candidate);

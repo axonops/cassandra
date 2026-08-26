@@ -828,7 +828,7 @@ public class UnifiedCompactionStrategyTest
         // far below any shard's, but above ShardManager.MINIMUM_TOKEN_COVERAGE, so their density
         // (size / span) is orders of magnitude higher than any real sstable's and they are placed
         // on high, otherwise empty levels where no overlap set of size >= 2 can form. Background
-        // selection must still consume them eventually (CASSANDRA-TBD).
+        // selection must still consume them eventually (CASSANDRA-21615).
         Controller controller = Mockito.mock(Controller.class);
         long minimalSizeBytes = 4 << 20;
         when(controller.getScalingParameter(anyInt())).thenReturn(2); // T4: F=4, T=4
@@ -842,6 +842,7 @@ public class UnifiedCompactionStrategyTest
         when(controller.maxThroughput()).thenReturn(Double.MAX_VALUE);
         when(controller.maxSSTablesToCompact()).thenReturn(64);
         when(controller.overlapInclusionMethod()).thenReturn(Overlaps.InclusionMethod.TRANSITIVE);
+        when(controller.getMinSizeForDensityLevelling()).thenReturn(ONE_MB);
         Random randomMock = Mockito.mock(Random.class);
         when(randomMock.nextInt(anyInt())).thenReturn(0);
         when(controller.random()).thenReturn(randomMock);
@@ -896,6 +897,61 @@ public class UnifiedCompactionStrategyTest
         assertTrue("Background selection never consumed " + missed.size() + " of " + tinyCount +
                    " tiny near-point-coverage sstables: " + missed,
                    missed.isEmpty());
+    }
+
+    @Test
+    public void testLevellingDensityClampBoundary()
+    {
+        // SSTables below the minimum size for density levelling must be assigned to level 0 no matter
+        // how narrow their token span; sstables at or above it must keep their density-derived level.
+        Controller controller = Mockito.mock(Controller.class);
+        long minimalSizeBytes = 4 << 20;
+        when(controller.getScalingParameter(anyInt())).thenReturn(2); // T4: F=4, T=4
+        when(controller.getFanout(anyInt())).thenCallRealMethod();
+        when(controller.getThreshold(anyInt())).thenCallRealMethod();
+        when(controller.getMaxLevelDensity(anyInt(), anyDouble())).thenCallRealMethod();
+        when(controller.getSurvivalFactor(anyInt())).thenReturn(1.0);
+        when(controller.getNumShards(anyDouble())).thenReturn(1);
+        when(controller.getBaseSstableSize(anyInt())).thenReturn((double) minimalSizeBytes);
+        when(controller.maxConcurrentCompactions()).thenReturn(1000);
+        when(controller.maxThroughput()).thenReturn(Double.MAX_VALUE);
+        when(controller.maxSSTablesToCompact()).thenReturn(64);
+        when(controller.getMinSizeForDensityLevelling()).thenReturn(ONE_MB);
+        when(controller.random()).thenCallRealMethod();
+
+        UnifiedCompactionStrategy strategy = new UnifiedCompactionStrategy(cfs, new HashMap<>(), controller);
+
+        Token min = partitioner.getMinimumToken();
+        Token max = partitioner.getMaximumToken();
+        ByteBuffer emptyBuffer = ByteBuffer.allocate(0);
+        long timestamp = System.currentTimeMillis();
+        final double tinySpan = 1e-11;
+
+        DecoratedKey belowFirst = new BufferDecoratedKey(partitioner.split(min, max, 0.25), emptyBuffer);
+        DecoratedKey belowLast = new BufferDecoratedKey(partitioner.split(min, max, 0.25 + tinySpan), emptyBuffer);
+        SSTableReader belowThreshold = mockSSTable(0, ONE_MB - 1, timestamp, 0.0, belowFirst, belowLast);
+
+        DecoratedKey atFirst = new BufferDecoratedKey(partitioner.split(min, max, 0.75), emptyBuffer);
+        DecoratedKey atLast = new BufferDecoratedKey(partitioner.split(min, max, 0.75 + tinySpan), emptyBuffer);
+        SSTableReader atThreshold = mockSSTable(0, ONE_MB, timestamp + 1, 0.0, atFirst, atLast);
+
+        List<SSTableReader> sstables = new ArrayList<>();
+        sstables.add(belowThreshold);
+        sstables.add(atThreshold);
+        strategy.addSSTables(sstables);
+        dataTracker.addInitialSSTables(sstables);
+
+        assertEquals(0, levelIndexOf(strategy, belowThreshold));
+        assertTrue("An sstable at the minimum size must still be levelled by its density",
+                   levelIndexOf(strategy, atThreshold) > 0);
+    }
+
+    private static int levelIndexOf(UnifiedCompactionStrategy strategy, SSTableReader sstable)
+    {
+        for (UnifiedCompactionStrategy.Level level : strategy.getLevels())
+            if (level.getSSTables().contains(sstable))
+                return level.getIndex();
+        throw new AssertionError("SSTable not assigned to any level: " + sstable);
     }
 
     SSTableReader mockSSTable(int level, long bytesOnDisk, long timestamp, double hotness, DecoratedKey first, DecoratedKey last)

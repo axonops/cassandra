@@ -356,6 +356,21 @@ public class Controller
     }
 
     /**
+     * The minimum on-disk size for an sstable to be levelled by its density. SSTables smaller than this (typically
+     * the product of repair streaming a small replica difference) can cover a minute fraction of the token space,
+     * which would give them a far higher density than any legitimately compacted sstable and place them on high
+     * levels of the hierarchy where they never overlap with other sstables and are never selected for compaction.
+     * Such sstables are levelled by their size alone instead, which assigns them to level 0 (CASSANDRA-21615).
+     * <p>
+     * The minimum sstable size option is used as the threshold, floored to {@link #MIN_TARGET_SSTABLE_SIZE} so that
+     * disabling flush splitting with a zero min_sstable_size does not also disable this protection.
+     */
+    public long getMinSizeForDensityLevelling()
+    {
+        return Math.max(minSSTableSize, MIN_TARGET_SSTABLE_SIZE);
+    }
+
+    /**
      * @return the survival factor o
      * @param index
      */

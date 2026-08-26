@@ -148,7 +148,7 @@ public class UnifiedCompactionDensitiesTest extends TestBaseImpl
      * {@link org.apache.cassandra.db.compaction.ShardManager}, giving them a density orders of
      * magnitude above any real sstable's; they are placed on high, otherwise empty levels where no
      * overlap set of size >= 2 ever forms and background compaction never selects them, so every
-     * repair round grows the live sstable count permanently (CASSANDRA-TBD).
+     * repair round grows the live sstable count permanently (CASSANDRA-21615).
      * <p>
      * The desired behaviour asserted here: once background compaction has had the opportunity to
      * run, repair-streamed tiny sstables do not accumulate without bound across repair rounds.
@@ -179,6 +179,13 @@ public class UnifiedCompactionDensitiesTest extends TestBaseImpl
             int[] tinyPerRound = new int[rounds];
             for (int round = 0; round < rounds; round++)
             {
+                // Ordinary write activity continues on both replicas between repairs, so that level 0
+                // keeps receiving flushed sstables and background compaction keeps running on it.
+                for (long id = 10000 + round * 1000; id < 10500 + round * 1000; id++)
+                    cluster.coordinator(1).execute(withKeyspace("insert into %s.tbl (id, value) values (?, ?)"),
+                                                   ConsistencyLevel.ALL, id, makeRandomString(200));
+                cluster.forEach(x -> x.flush(KEYSPACE));
+
                 long[] pair = pairs.get(round); // {idA, idB, tokenA, tokenB}
                 // Write the pair only to node1, so that node2 must receive it through repair streaming.
                 for (int k = 0; k < 2; k++)
@@ -192,16 +199,19 @@ public class UnifiedCompactionDensitiesTest extends TestBaseImpl
                 for (int k = 0; k < 2; k++)
                     assertEquals(1, cluster.get(2).executeInternal(withKeyspace("select id from %s.tbl where id = ?"), pair[k]).length);
 
-                // Give background compaction on the receiving node ample opportunity to run.
+                // Give background compaction on the receiving node ample opportunity to run. Under
+                // incremental repair some passes are consumed by pending-to-repaired promotion tasks.
                 cluster.get(2).runOnInstance(() -> {
                     ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore("tbl");
-                    for (int i = 0; i < 3; i++)
+                    for (int i = 0; i < 5; i++)
                         cfs.enableAutoCompaction(true);
                 });
 
+                // Repair-streamed two-key sstables are a few hundred bytes; the smallest legitimate
+                // sstables in this workload (flush shards) are tens of KiB, so 8KiB separates them.
                 tinyPerRound[round] = cluster.get(2).callOnInstance(() -> {
                     ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore("tbl");
-                    return (int) cfs.getLiveSSTables().stream().filter(t -> t.onDiskLength() < 32 * 1024).count();
+                    return (int) cfs.getLiveSSTables().stream().filter(t -> t.onDiskLength() < 8 * 1024).count();
                 });
                 LoggerFactory.getLogger(getClass()).info("Round {}: node2 has {} tiny sstables", round, tinyPerRound[round]);
             }
@@ -209,6 +219,14 @@ public class UnifiedCompactionDensitiesTest extends TestBaseImpl
             assertTrue("Background compaction never consumed any repair-streamed tiny sstable; " +
                        "tiny sstable count per repair round on the receiving node: " + Arrays.toString(tinyPerRound),
                        tinyPerRound[rounds - 1] < rounds);
+
+            // Compacting the repair-streamed sstables must not lose or corrupt their data.
+            for (long[] pair : pairs)
+                for (int k = 0; k < 2; k++)
+                    assertEquals("Repaired row lost after compaction, id " + pair[k], 1,
+                                 cluster.get(2).executeInternal(withKeyspace("select id from %s.tbl where id = ?"), pair[k]).length);
+            for (long id = 10000; id < 10500; id++)
+                assertEquals(1, cluster.get(2).executeInternal(withKeyspace("select id from %s.tbl where id = ?"), id).length);
         }
     }
 
