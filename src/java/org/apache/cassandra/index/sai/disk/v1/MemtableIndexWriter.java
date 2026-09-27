@@ -20,6 +20,8 @@ package org.apache.cassandra.index.sai.disk.v1;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.Iterator;
+import java.util.Map;
+import java.util.NavigableMap;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.base.Stopwatch;
@@ -36,8 +38,10 @@ import org.apache.cassandra.index.sai.disk.v1.bbtree.NumericIndexWriter;
 import org.apache.cassandra.index.sai.disk.v1.segment.SegmentMetadata;
 import org.apache.cassandra.index.sai.disk.v1.segment.SegmentWriter;
 import org.apache.cassandra.index.sai.disk.v1.trie.LiteralIndexWriter;
+import org.apache.cassandra.index.sai.memory.AnalyzedMemtableTermsIterator;
 import org.apache.cassandra.index.sai.memory.MemtableIndex;
 import org.apache.cassandra.index.sai.memory.MemtableTermsIterator;
+import org.apache.cassandra.index.sai.memory.TrieMemoryIndex;
 import org.apache.cassandra.index.sai.metrics.IndexMetrics;
 import org.apache.cassandra.index.sai.utils.IndexIdentifier;
 import org.apache.cassandra.index.sai.utils.IndexTermType;
@@ -61,6 +65,7 @@ public class MemtableIndexWriter implements PerColumnIndexWriter
     private final IndexMetrics indexMetrics;
     private final MemtableIndex memtable;
     private final RowMapping rowMapping;
+    private final boolean analyzed;
 
     private PrimaryKey minKey;
     private PrimaryKey maxKey;
@@ -74,6 +79,17 @@ public class MemtableIndexWriter implements PerColumnIndexWriter
                                IndexMetrics indexMetrics,
                                RowMapping rowMapping)
     {
+        this(memtable, indexDescriptor, indexTermType, indexIdentifier, indexMetrics, rowMapping, false);
+    }
+
+    public MemtableIndexWriter(MemtableIndex memtable,
+                               IndexDescriptor indexDescriptor,
+                               IndexTermType indexTermType,
+                               IndexIdentifier indexIdentifier,
+                               IndexMetrics indexMetrics,
+                               RowMapping rowMapping,
+                               boolean analyzed)
+    {
         assert rowMapping != null && rowMapping != RowMapping.DUMMY : "Row mapping must exist during FLUSH.";
 
         this.indexDescriptor = indexDescriptor;
@@ -82,6 +98,7 @@ public class MemtableIndexWriter implements PerColumnIndexWriter
         this.indexMetrics = indexMetrics;
         this.memtable = memtable;
         this.rowMapping = rowMapping;
+        this.analyzed = analyzed;
     }
 
     @Override
@@ -141,6 +158,20 @@ public class MemtableIndexWriter implements PerColumnIndexWriter
             if (indexTermType.isVector())
             {
                 flushVectorIndex(start, stopwatch);
+            }
+            else if (analyzed)
+            {
+                final Iterator<Pair<ByteComparable, RowMapping.TermPostings>> iterator = rowMapping.mergeAnalyzed(memtable, indexTermType.isNonFrozenCollection());
+
+                long cellCount = 0;
+                if (iterator.hasNext())
+                {
+                    try (AnalyzedMemtableTermsIterator terms = new AnalyzedMemtableTermsIterator(memtable.getMinTerm(), memtable.getMaxTerm(), iterator))
+                    {
+                        cellCount = flushAnalyzed(terms);
+                    }
+                }
+                completeIndexFlush(cellCount, start, stopwatch);
             }
             else
             {
@@ -205,6 +236,62 @@ public class MemtableIndexWriter implements PerColumnIndexWriter
         }
 
         return numRows;
+    }
+
+    private long flushAnalyzed(AnalyzedMemtableTermsIterator terms) throws IOException
+    {
+        SegmentWriter writer = new LiteralIndexWriter(indexDescriptor, indexIdentifier, buildDocLengths());
+
+        SegmentMetadata.ComponentMetadataMap indexMetas = writer.writeCompleteSegment(terms);
+        long numRows = writer.getNumberOfRows();
+
+        // If no rows were written we need to delete any created column index components
+        // so that the index is correctly identified as being empty (only having a completion marker)
+        if (numRows == 0)
+        {
+            indexDescriptor.deleteColumnIndex(indexTermType, indexIdentifier);
+            return 0;
+        }
+
+        // During index memtable flush, the data is sorted based on terms.
+        SegmentMetadata metadata = new SegmentMetadata(0,
+                                                       numRows,
+                                                       terms.getMinSSTableRowId(), terms.getMaxSSTableRowId(),
+                                                       minKey, maxKey,
+                                                       terms.getMinTerm(), terms.getMaxTerm(),
+                                                       indexMetas);
+
+        try (MetadataWriter metadataWriter = new MetadataWriter(indexDescriptor.openPerIndexOutput(IndexComponent.META, indexIdentifier)))
+        {
+            SegmentMetadata.write(metadataWriter, Collections.singletonList(metadata));
+        }
+
+        return numRows;
+    }
+
+    /**
+     * Maps the memtable's per-key doc lengths through the row mapping into an array indexed by
+     * segment row id, which equals sstable row id because a flushed segment's row id offset is 0.
+     */
+    private int[] buildDocLengths()
+    {
+        NavigableMap<PrimaryKey, TrieMemoryIndex.DocLength> docLengthMap = memtable.docLengths();
+
+        int maxSegmentRowId = -1;
+        for (PrimaryKey key : docLengthMap.keySet())
+            maxSegmentRowId = Math.max(maxSegmentRowId, rowMapping.get(key));
+
+        if (maxSegmentRowId < 0)
+            return new int[0];
+
+        int[] docLengths = new int[maxSegmentRowId + 1];
+        for (Map.Entry<PrimaryKey, TrieMemoryIndex.DocLength> entry : docLengthMap.entrySet())
+        {
+            int segmentRowId = rowMapping.get(entry.getKey());
+            if (segmentRowId >= 0)
+                docLengths[segmentRowId] = entry.getValue().length;
+        }
+        return docLengths;
     }
 
     private void flushVectorIndex(long startTime, Stopwatch stopwatch) throws IOException

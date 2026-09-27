@@ -18,7 +18,11 @@
 
 package org.apache.cassandra.index.sai.utils;
 
+import javax.annotation.Nullable;
+
 import com.google.common.base.Objects;
+
+import org.apache.cassandra.index.sai.disk.format.Version;
 
 /**
  * This is a simple wrapper around the index identity. Its primary purpose is to isolate classes that only need
@@ -30,12 +34,25 @@ public class IndexIdentifier
     public final String keyspaceName;
     public final String tableName;
     public final String indexName;
+    /**
+     * The SAI format version this index writes and reads its per-column components with. Only indexes
+     * with an {@code index_analyzer} option carry a version here. When null the per-column components
+     * use the owning SSTable's version. Not part of the index identity.
+     */
+    @Nullable
+    public final Version version;
 
     public IndexIdentifier(String keyspaceName, String tableName, String indexName)
+    {
+        this(keyspaceName, tableName, indexName, null);
+    }
+
+    public IndexIdentifier(String keyspaceName, String tableName, String indexName, @Nullable Version version)
     {
         this.keyspaceName = keyspaceName;
         this.tableName = tableName;
         this.indexName = indexName;
+        this.version = version;
     }
 
     /**

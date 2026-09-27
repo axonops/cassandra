@@ -46,8 +46,13 @@ public class SAICodecUtils
 
     public static void writeHeader(IndexOutput out) throws IOException
     {
+        writeHeader(out, Version.LATEST);
+    }
+
+    public static void writeHeader(IndexOutput out, Version version) throws IOException
+    {
         writeBEInt(out, CODEC_MAGIC);
-        out.writeString(Version.LATEST.toString());
+        out.writeString(version.toString());
     }
 
     public static void writeFooter(IndexOutput out) throws IOException

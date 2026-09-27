@@ -46,6 +46,13 @@ import org.apache.cassandra.serializers.MarshalException;
  */
 public final class LuceneTextAnalyzer implements Closeable
 {
+    /**
+     * The fixed position offset between consecutive collection elements of one row. Every consumer
+     * of positions, the write path and the read side post-filter re-analysis, must apply the same
+     * base arithmetic so a phrase can never match across element boundaries.
+     */
+    public static final int POSITION_GAP = 65536;
+
     private static final String FIELD_NAME = "sai";
 
     private final Analyzer analyzer;

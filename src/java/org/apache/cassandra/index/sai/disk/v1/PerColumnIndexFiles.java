@@ -45,7 +45,7 @@ public class PerColumnIndexFiles implements Closeable
     {
         this.indexDescriptor = indexDescriptor;
         this.indexIdentifier = indexIdentifier;
-        for (IndexComponent component : indexDescriptor.version.onDiskFormat().perColumnIndexComponents(indexTermType))
+        for (IndexComponent component : indexDescriptor.perIndexVersion(indexIdentifier).onDiskFormat().perColumnIndexComponents(indexTermType))
         {
             if (component == IndexComponent.META || component == IndexComponent.COLUMN_COMPLETION_MARKER)
                 continue;
@@ -61,6 +61,11 @@ public class PerColumnIndexFiles implements Closeable
     public FileHandle postingLists()
     {
         return getFile(IndexComponent.POSTING_LISTS);
+    }
+
+    public FileHandle positions()
+    {
+        return getFile(IndexComponent.POSITIONS);
     }
 
     public FileHandle balancedTree()

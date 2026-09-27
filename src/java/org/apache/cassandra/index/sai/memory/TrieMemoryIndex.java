@@ -20,10 +20,13 @@ package org.apache.cassandra.index.sai.memory;
 
 import java.nio.ByteBuffer;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.PriorityQueue;
 import java.util.SortedSet;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Function;
@@ -31,6 +34,7 @@ import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.carrotsearch.hppc.IntArrayList;
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.PartitionPosition;
@@ -41,6 +45,8 @@ import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.index.sai.QueryContext;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
+import org.apache.cassandra.index.sai.analyzer.AnalyzedToken;
+import org.apache.cassandra.index.sai.analyzer.LuceneTextAnalyzer;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.v1.segment.SegmentMetadata;
 import org.apache.cassandra.index.sai.disk.v1.vector.PrimaryKeyWithScore;
@@ -49,6 +55,7 @@ import org.apache.cassandra.index.sai.plan.Expression;
 import org.apache.cassandra.index.sai.utils.IndexIdentifier;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.index.sai.utils.PrimaryKeys;
+import org.apache.cassandra.index.sai.utils.PrimaryKeysWithPositions;
 import org.apache.cassandra.utils.CloseableIterator;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
@@ -64,8 +71,17 @@ public class TrieMemoryIndex extends MemoryIndex
     private static final int MAX_RECURSIVE_KEY_LENGTH = 128;
     private static final int MINIMUM_PRIORITY_QUEUE_SIZE = 128;
 
+    // from https://github.com/gaul/java-collection-overhead plus the entry object itself
+    private static final long DOC_LENGTH_ENTRY_OVERHEAD = 60;
+
     private final InMemoryTrie<PrimaryKeys> data;
     private final PrimaryKeysReducer primaryKeysReducer;
+    private final PrimaryKeysWithPositionsReducer analyzedReducer;
+    private final ConcurrentSkipListMap<PrimaryKey, DocLength> docLengths;
+
+    // Distinguishes row versions per primary key. Only ever incremented inside the synchronized add
+    // methods, so plain long arithmetic is safe.
+    private long nextEpoch;
 
     private ByteBuffer minTerm;
     private ByteBuffer maxTerm;
@@ -80,6 +96,8 @@ public class TrieMemoryIndex extends MemoryIndex
         super(index);
         this.data = new InMemoryTrie<>(TrieMemtable.BUFFER_TYPE);
         this.primaryKeysReducer = new PrimaryKeysReducer();
+        this.analyzedReducer = index.hasLuceneAnalyzer() ? new PrimaryKeysWithPositionsReducer() : null;
+        this.docLengths = index.hasLuceneAnalyzer() ? new ConcurrentSkipListMap<>() : null;
     }
 
     /**
@@ -124,6 +142,80 @@ public class TrieMemoryIndex extends MemoryIndex
         long offHeap = data.sizeOffHeap();
         long heapAllocations = primaryKeysReducer.heapAllocations();
         return (onHeap - initialSizeOnHeap) + (offHeap - initialSizeOffHeap) + (heapAllocations - reducerHeapSize);
+    }
+
+    /**
+     * Adds one row's analyzed values to the in-memory index, all values of the row in one call so
+     * collection elements get disjoint position spaces and the row's document length is complete.
+     *
+     * @param key partition key for the indexed row
+     * @param clustering clustering for the indexed row
+     * @param values the row's indexed values, one per collection element
+     * @return amount of heap allocated by the row
+     */
+    @Override
+    public synchronized long indexAnalyzedRow(DecoratedKey key, Clustering<?> clustering, Iterator<ByteBuffer> values)
+    {
+        final PrimaryKey primaryKey = index.hasClustering() ? index.keyFactory().create(key, clustering)
+                                                            : index.keyFactory().create(key);
+        final long initialSizeOnHeap = data.sizeOnHeap();
+        final long initialSizeOffHeap = data.sizeOffHeap();
+        final long reducerHeapSize = analyzedReducer.heapAllocations();
+
+        final long epoch = nextEpoch++;
+        long docLengthsHeap = 0;
+        int positionBase = 0;
+        int docLength = 0;
+        int element = 0;
+
+        while (values.hasNext())
+        {
+            ByteBuffer value = values.next();
+            if (!index.analyzedTermLimits().validateElementOrdinal(element++, key::toString, false))
+                continue;
+
+            List<AnalyzedToken> tokens = index.luceneIndexAnalyzer().analyze(value);
+            if (tokens.isEmpty() || !index.analyzedTermLimits().validate(tokens, key::toString, false, null))
+            {
+                // The value indexes nothing, but its element still occupies a distinct position space
+                positionBase += LuceneTextAnalyzer.POSITION_GAP;
+                continue;
+            }
+
+            Map<ByteBuffer, IntArrayList> termPositions = new LinkedHashMap<>();
+            int lastPosition = 0;
+            for (AnalyzedToken token : tokens)
+            {
+                termPositions.computeIfAbsent(token.bytes(), t -> new IntArrayList()).add(positionBase + token.position());
+                lastPosition = token.position();
+            }
+
+            for (Map.Entry<ByteBuffer, IntArrayList> entry : termPositions.entrySet())
+            {
+                setMinMaxTerm(entry.getKey().duplicate());
+                addAnalyzedTerm(primaryKey, entry.getKey(), entry.getValue().toArray(), epoch);
+            }
+
+            docLength += tokens.size();
+            positionBase += lastPosition + 1 + LuceneTextAnalyzer.POSITION_GAP;
+        }
+
+        // Unconditional replace, so the map always holds the row's newest epoch and token count
+        if (docLengths.put(primaryKey, new DocLength(epoch, docLength)) == null)
+            docLengthsHeap = DOC_LENGTH_ENTRY_OVERHEAD;
+
+        long onHeap = data.sizeOnHeap();
+        long offHeap = data.sizeOffHeap();
+        long heapAllocations = analyzedReducer.heapAllocations();
+        return (onHeap - initialSizeOnHeap) + (offHeap - initialSizeOffHeap) + (heapAllocations - reducerHeapSize) + docLengthsHeap;
+    }
+
+    @Override
+    public NavigableMap<PrimaryKey, DocLength> docLengths()
+    {
+        if (docLengths == null)
+            throw new UnsupportedOperationException();
+        return docLengths;
     }
 
     @Override
@@ -238,6 +330,27 @@ public class TrieMemoryIndex extends MemoryIndex
             {
                 throw new RuntimeException(e);
             }
+        }
+    }
+
+    private void addAnalyzedTerm(PrimaryKey primaryKey, ByteBuffer term, int[] positions, long epoch)
+    {
+        final ByteComparable comparableBytes = asComparableBytes(term);
+        analyzedReducer.prepare(positions, epoch);
+        try
+        {
+            if (term.limit() <= MAX_RECURSIVE_KEY_LENGTH)
+            {
+                data.putRecursive(comparableBytes, primaryKey, analyzedReducer);
+            }
+            else
+            {
+                data.apply(Trie.singleton(comparableBytes, primaryKey), analyzedReducer);
+            }
+        }
+        catch (InMemoryTrie.SpaceExhaustedException e)
+        {
+            throw new RuntimeException(e);
         }
     }
 
@@ -380,6 +493,54 @@ public class TrieMemoryIndex extends MemoryIndex
         long heapAllocations()
         {
             return heapAllocations.longValue();
+        }
+    }
+
+    private static class PrimaryKeysWithPositionsReducer implements InMemoryTrie.UpsertTransformer<PrimaryKeys, PrimaryKey>
+    {
+        private final LongAdder heapAllocations = new LongAdder();
+
+        // Set immediately before each trie upsert instead of allocating a carrier object per term.
+        // Safe because every trie mutation happens inside the index's synchronized add methods.
+        private int[] positions;
+        private long epoch;
+
+        void prepare(int[] positions, long epoch)
+        {
+            this.positions = positions;
+            this.epoch = epoch;
+        }
+
+        @Override
+        public PrimaryKeys apply(PrimaryKeys existing, PrimaryKey neww)
+        {
+            if (existing == null)
+            {
+                existing = new PrimaryKeysWithPositions();
+                heapAllocations.add(existing.unsharedHeapSize());
+            }
+            heapAllocations.add(((PrimaryKeysWithPositions) existing).add(neww, positions, epoch));
+            return existing;
+        }
+
+        long heapAllocations()
+        {
+            return heapAllocations.longValue();
+        }
+    }
+
+    /**
+     * One row's newest epoch and token count for the doc-length map of an analyzed index
+     */
+    public static class DocLength
+    {
+        public final long epoch;
+        public final int length;
+
+        DocLength(long epoch, int length)
+        {
+            this.epoch = epoch;
+            this.length = length;
         }
     }
 }

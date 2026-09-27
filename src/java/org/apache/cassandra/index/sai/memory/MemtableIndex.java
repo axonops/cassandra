@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Iterator;
 import java.util.List;
+import java.util.NavigableMap;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Function;
 
@@ -96,6 +97,19 @@ public class MemtableIndex implements MemtableOrdering
         writeCount.increment();
         estimatedMemoryUsed.add(ram);
         return ram;
+    }
+
+    public long indexAnalyzedRow(DecoratedKey key, Clustering<?> clustering, Iterator<ByteBuffer> values)
+    {
+        long ram = memoryIndex.indexAnalyzedRow(key, clustering, values);
+        writeCount.increment();
+        estimatedMemoryUsed.add(ram);
+        return ram;
+    }
+
+    public NavigableMap<PrimaryKey, TrieMemoryIndex.DocLength> docLengths()
+    {
+        return memoryIndex.docLengths();
     }
 
     public long update(DecoratedKey key, Clustering<?> clustering, ByteBuffer oldValue, ByteBuffer newValue)

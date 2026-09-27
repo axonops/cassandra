@@ -28,6 +28,7 @@ import org.junit.Test;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.StorageAttachedIndexGroup;
@@ -112,6 +113,40 @@ public class GroupComponentsTest extends SAITester
         assertEquals(Version.LATEST.onDiskFormat().perSSTableIndexComponents(false).size() +
                      Version.LATEST.onDiskFormat().perColumnIndexComponents(indexTermType).size(),
                      components.size());
+    }
+
+    @Test
+    public void getComponentsIncludesPositionsForAnalyzedIndexOnly()
+    {
+        createTable("CREATE TABLE %s (pk int primary key, v1 text, v2 text)");
+        String plainName = createIndex("CREATE INDEX ON %s(v1) USING 'sai'");
+        String analyzedName = createIndex("CREATE INDEX ON %s(v2) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+
+        SecondaryIndexManager indexManager = getCurrentColumnFamilyStore().indexManager;
+        StorageAttachedIndex plain = (StorageAttachedIndex) indexManager.getIndexByName(plainName);
+        StorageAttachedIndex analyzed = (StorageAttachedIndex) indexManager.getIndexByName(analyzedName);
+
+        // the plain index advertises the stock version aa component set, the analyzed index its
+        // own version ab set with positions
+        Set<String> plainComponents = plain.getComponents().stream().map(c -> c.name).collect(Collectors.toSet());
+        Set<String> analyzedComponents = analyzed.getComponents().stream().map(c -> c.name).collect(Collectors.toSet());
+
+        assertEquals(Version.AA.onDiskFormat().perColumnIndexComponents(plain.termType()).size(), plainComponents.size());
+        assertEquals(Version.AB.onDiskFormat().perColumnIndexComponents(analyzed.termType()).size(), analyzedComponents.size());
+
+        Assert.assertTrue(plainComponents.stream().allMatch(name -> name.contains("SAI+aa+")));
+        Assert.assertTrue(plainComponents.stream().noneMatch(name -> name.contains("Positions")));
+        Assert.assertTrue(analyzedComponents.stream().allMatch(name -> name.contains("SAI+ab+")));
+        Assert.assertTrue(analyzedComponents.stream().anyMatch(name -> name.contains("Positions")));
+
+        execute("INSERT INTO %s (pk, v1, v2) VALUES (1, 'apple', 'quick fox')");
+        flush();
+
+        SSTableReader sstable = Iterables.getOnlyElement(getCurrentColumnFamilyStore().getLiveSSTables());
+        StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(getCurrentColumnFamilyStore());
+        assertNotNull(group);
+        Set<Component> live = StorageAttachedIndexGroup.getLiveComponents(sstable, getIndexesFromGroup(group));
+        Assert.assertTrue(live.stream().anyMatch(component -> component.name.contains("SAI+ab+") && component.name.contains("Positions")));
     }
 
     private Collection<StorageAttachedIndex> getIndexesFromGroup(StorageAttachedIndexGroup group)

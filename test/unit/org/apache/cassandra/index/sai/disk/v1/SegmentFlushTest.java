@@ -23,12 +23,15 @@ import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
+import java.util.Iterator;
 import java.util.List;
 
 import com.google.common.base.Stopwatch;
+import com.google.common.collect.ImmutableMap;
 import org.junit.After;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -36,6 +39,7 @@ import org.junit.Test;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.rows.BTreeRow;
@@ -45,12 +49,16 @@ import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.index.sai.IndexValidation;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.index.sai.disk.RowMapping;
 import org.apache.cassandra.index.sai.disk.format.IndexComponent;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
+import org.apache.cassandra.index.sai.disk.format.Version;
+import org.apache.cassandra.index.sai.memory.MemtableIndex;
 import org.apache.cassandra.index.sai.utils.IndexEntry;
 import org.apache.cassandra.index.sai.utils.IndexIdentifier;
 import org.apache.cassandra.index.sai.disk.v1.segment.SegmentBuilder;
 import org.apache.cassandra.index.sai.disk.v1.segment.SegmentMetadata;
+import org.apache.cassandra.index.sai.disk.v1.trie.LiteralIndexWriter;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.index.sai.utils.TermsIterator;
 import org.apache.cassandra.io.sstable.Descriptor;
@@ -233,6 +241,126 @@ public class SegmentFlushTest
         {
             assertTrue("Expected CorruptIndexException cause; got " + expected.getCause(), expected.getCause() instanceof CorruptIndexException);
         }
+    }
+
+    @Test
+    public void analyzedIndexWritesPositionsComponent() throws IOException
+    {
+        Path tmpDir = Files.createTempDirectory("SegmentFlushTest");
+        IndexDescriptor indexDescriptor = IndexDescriptor.create(new Descriptor(new File(tmpDir.toFile()), "ks", "cf", new SequenceBasedSSTableId(1)), Murmur3Partitioner.instance, SAITester.EMPTY_COMPARATOR);
+        ColumnMetadata column = ColumnMetadata.regularColumn("sai", "internal", "body", UTF8Type.instance);
+        StorageAttachedIndex index = SAITester.createMockIndex(column, ImmutableMap.of("index_analyzer", "standard"));
+
+        SSTableIndexWriter writer = new SSTableIndexWriter(indexDescriptor, index, V1OnDiskFormat.SEGMENT_BUILD_MEMORY_LIMITER, () -> true);
+
+        List<DecoratedKey> keys = Arrays.asList(dk("1"), dk("2"));
+        Collections.sort(keys);
+
+        writer.addRow(SAITester.TEST_FACTORY.create(keys.get(0)), createRow(column, UTF8Type.instance.decompose("quick brown fox")), 0L);
+        writer.addRow(SAITester.TEST_FACTORY.create(keys.get(1)), createRow(column, UTF8Type.instance.decompose("quick dog")), 1L);
+        writer.complete(Stopwatch.createStarted());
+
+        // The analyzed index writes its per-column components, positions included, under version ab
+        assertEquals(Version.AB, indexDescriptor.perIndexVersion(index.identifier()));
+        assertTrue(indexDescriptor.hasComponent(IndexComponent.POSITIONS, index.identifier()));
+
+        // Will throw if checksum validation fails, walking the POSITIONS frames as well:
+        indexDescriptor.validatePerIndexComponents(index.termType(), index.identifier(), IndexValidation.CHECKSUM, true, true);
+
+        MetadataSource source = MetadataSource.loadColumnMetadata(indexDescriptor, index.identifier());
+        List<SegmentMetadata> segments = SegmentMetadata.load(source, indexDescriptor.primaryKeyFactory);
+        assertEquals(1, segments.size());
+
+        // one posting per distinct (term, rowid) pair
+        assertEquals(5, segments.get(0).numRows);
+
+        SegmentMetadata.ComponentMetadata positions = segments.get(0).componentMetadatas.get(IndexComponent.POSITIONS);
+        assertEquals("2", positions.attributes.get(LiteralIndexWriter.DOC_COUNT));
+        assertEquals("5", positions.attributes.get(LiteralIndexWriter.SUM_DOC_LENGTHS));
+        assertTrue(positions.attributes.containsKey(LiteralIndexWriter.DOC_LENGTHS_OFFSET));
+
+        verifyAnalyzedTerms(indexDescriptor, index.identifier(), segments.get(0), Arrays.asList("brown", "dog", "fox", "quick"));
+    }
+
+    @Test
+    public void analyzedMemtableFlushDropsStaleAndDeletedEntries() throws Exception
+    {
+        Path tmpDir = Files.createTempDirectory("SegmentFlushTest");
+        IndexDescriptor indexDescriptor = IndexDescriptor.create(new Descriptor(new File(tmpDir.toFile()), "ks", "cf", new SequenceBasedSSTableId(1)), Murmur3Partitioner.instance, SAITester.EMPTY_COMPARATOR);
+        ColumnMetadata column = ColumnMetadata.regularColumn("sai", "internal", "body", UTF8Type.instance);
+        StorageAttachedIndex index = SAITester.createMockIndex(column, ImmutableMap.of("index_analyzer", "standard"));
+
+        List<DecoratedKey> keys = Arrays.asList(dk("1"), dk("2"), dk("3"));
+        Collections.sort(keys);
+
+        MemtableIndex memtableIndex = new MemtableIndex(index, null);
+        memtableIndex.indexAnalyzedRow(keys.get(0), Clustering.EMPTY, values("quick fox"));
+        // the scalar overwrite makes the first value's terms stale
+        memtableIndex.indexAnalyzedRow(keys.get(0), Clustering.EMPTY, values("lazy fox"));
+        // this row never reaches the row mapping, the memtable equivalent of a deleted row
+        memtableIndex.indexAnalyzedRow(keys.get(1), Clustering.EMPTY, values("brown dog"));
+        memtableIndex.indexAnalyzedRow(keys.get(2), Clustering.EMPTY, values("gray wolf"));
+
+        RowMapping rowMapping = RowMapping.create(OperationType.FLUSH);
+        rowMapping.add(SAITester.TEST_FACTORY.create(keys.get(0)), 0);
+        rowMapping.add(SAITester.TEST_FACTORY.create(keys.get(2)), 1);
+        rowMapping.complete();
+
+        MemtableIndexWriter writer = new MemtableIndexWriter(memtableIndex,
+                                                             indexDescriptor,
+                                                             index.termType(),
+                                                             index.identifier(),
+                                                             index.indexMetrics(),
+                                                             rowMapping,
+                                                             true);
+        writer.addRow(SAITester.TEST_FACTORY.create(keys.get(0)), createRow(column, UTF8Type.instance.decompose("lazy fox")), 0);
+        writer.addRow(SAITester.TEST_FACTORY.create(keys.get(2)), createRow(column, UTF8Type.instance.decompose("gray wolf")), 1);
+        writer.complete(Stopwatch.createStarted());
+
+        indexDescriptor.validatePerIndexComponents(index.termType(), index.identifier(), IndexValidation.CHECKSUM, true, true);
+
+        MetadataSource source = MetadataSource.loadColumnMetadata(indexDescriptor, index.identifier());
+        List<SegmentMetadata> segments = SegmentMetadata.load(source, indexDescriptor.primaryKeyFactory);
+        assertEquals(1, segments.size());
+
+        // stale and deleted entries are excluded: (lazy, fox) for row 0 and (gray, wolf) for row 1
+        assertEquals(4, segments.get(0).numRows);
+
+        SegmentMetadata.ComponentMetadata positions = segments.get(0).componentMetadatas.get(IndexComponent.POSITIONS);
+        assertEquals("2", positions.attributes.get(LiteralIndexWriter.DOC_COUNT));
+        assertEquals("4", positions.attributes.get(LiteralIndexWriter.SUM_DOC_LENGTHS));
+
+        verifyAnalyzedTerms(indexDescriptor, index.identifier(), segments.get(0), Arrays.asList("fox", "gray", "lazy", "wolf"));
+    }
+
+    private void verifyAnalyzedTerms(IndexDescriptor indexDescriptor,
+                                     IndexIdentifier indexIdentifier,
+                                     SegmentMetadata segmentMetadata,
+                                     List<String> expectedTerms) throws IOException
+    {
+        FileHandle termsData = indexDescriptor.createPerIndexFileHandle(IndexComponent.TERMS_DATA, indexIdentifier, null);
+        FileHandle postingLists = indexDescriptor.createPerIndexFileHandle(IndexComponent.POSTING_LISTS, indexIdentifier, null);
+
+        try (TermsIterator iterator = new TermsScanner(termsData, postingLists, segmentMetadata.componentMetadatas.get(IndexComponent.TERMS_DATA).root))
+        {
+            for (String expectedTerm : expectedTerms)
+            {
+                assertTrue("Expected term " + expectedTerm, iterator.hasNext());
+                IndexEntry indexEntry = iterator.next();
+                ByteBuffer term = UTF8Type.instance.decompose(expectedTerm);
+                assertEquals("Mismatch at term " + expectedTerm,
+                             0, ByteComparable.compare(indexEntry.term, v -> ByteSource.of(term, v), ByteComparable.Version.OSS50));
+            }
+            assertFalse(iterator.hasNext());
+        }
+    }
+
+    private Iterator<ByteBuffer> values(String... values)
+    {
+        List<ByteBuffer> buffers = new ArrayList<>(values.length);
+        for (String value : values)
+            buffers.add(UTF8Type.instance.decompose(value));
+        return buffers.iterator();
     }
 
     @Test

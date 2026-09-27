@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Set;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Objects;
@@ -113,6 +114,16 @@ public class IndexDescriptor
     public boolean hasClustering()
     {
         return clusteringComparator.size() > 0;
+    }
+
+    /**
+     * Returns the version the given index's per-column components are written and read with. Indexes
+     * with an {@code index_analyzer} option carry their own version on the {@link IndexIdentifier},
+     * everything else uses the SSTable's version.
+     */
+    public Version perIndexVersion(@Nullable IndexIdentifier indexIdentifier)
+    {
+        return indexIdentifier != null && indexIdentifier.version != null ? indexIdentifier.version : version;
     }
 
     public String componentName(IndexComponent indexComponent)
@@ -329,12 +340,13 @@ public class IndexDescriptor
 
     public Set<Component> getLivePerIndexComponents(IndexTermType indexTermType, IndexIdentifier indexIdentifier)
     {
-        return version.onDiskFormat()
-                      .perColumnIndexComponents(indexTermType)
-                      .stream()
-                      .filter(c -> fileFor(c, indexIdentifier).exists())
-                      .map(c -> version.makePerIndexComponent(c, indexIdentifier))
-                      .collect(Collectors.toSet());
+        Version perIndexVersion = perIndexVersion(indexIdentifier);
+        return perIndexVersion.onDiskFormat()
+                              .perColumnIndexComponents(indexTermType)
+                              .stream()
+                              .filter(c -> fileFor(c, indexIdentifier).exists())
+                              .map(c -> perIndexVersion.makePerIndexComponent(c, indexIdentifier))
+                              .collect(Collectors.toSet());
     }
 
     public long sizeOnDiskOfPerSSTableComponents()
@@ -350,7 +362,7 @@ public class IndexDescriptor
 
     public long sizeOnDiskOfPerIndexComponents(IndexTermType indexTermType, IndexIdentifier indexIdentifier)
     {
-        return version.onDiskFormat()
+        return perIndexVersion(indexIdentifier).onDiskFormat()
                       .perColumnIndexComponents(indexTermType)
                       .stream()
                       .map(c -> fileFor(c, indexIdentifier))
@@ -376,7 +388,7 @@ public class IndexDescriptor
 
         try
         {
-            version.onDiskFormat().validatePerColumnIndexComponents(this, indexTermType, indexIdentifier, validation == IndexValidation.CHECKSUM && validateChecksum);
+            perIndexVersion(indexIdentifier).onDiskFormat().validatePerColumnIndexComponents(this, indexTermType, indexIdentifier, validation == IndexValidation.CHECKSUM && validateChecksum);
             return true;
         }
         catch (UncheckedIOException e)
@@ -422,7 +434,7 @@ public class IndexDescriptor
 
     public void deleteColumnIndex(IndexTermType indexTermType, IndexIdentifier indexIdentifier)
     {
-        version.onDiskFormat()
+        perIndexVersion(indexIdentifier).onDiskFormat()
                .perColumnIndexComponents(indexTermType)
                .stream()
                .map(c -> fileFor(c, indexIdentifier))
@@ -463,13 +475,13 @@ public class IndexDescriptor
 
     private File createFile(IndexComponent component, IndexIdentifier indexIdentifier)
     {
-        Component customComponent = version.makePerIndexComponent(component, indexIdentifier);
+        Component customComponent = perIndexVersion(indexIdentifier).makePerIndexComponent(component, indexIdentifier);
         return sstableDescriptor.fileFor(customComponent);
     }
 
     private long numberOfPerIndexComponents(IndexTermType indexTermType, IndexIdentifier indexIdentifier)
     {
-        return version.onDiskFormat()
+        return perIndexVersion(indexIdentifier).onDiskFormat()
                       .perColumnIndexComponents(indexTermType)
                       .stream()
                       .map(c -> fileFor(c, indexIdentifier))

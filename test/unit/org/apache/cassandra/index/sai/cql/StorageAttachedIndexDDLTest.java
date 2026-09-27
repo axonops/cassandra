@@ -63,6 +63,7 @@ import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.SSTableContext;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.StorageAttachedIndexBuilder;
+import org.apache.cassandra.index.sai.analyzer.EqualsBehaviourWhenAnalyzed;
 import org.apache.cassandra.index.sai.analyzer.NonTokenizingOptions;
 import org.apache.cassandra.index.sai.disk.format.IndexComponent;
 import org.apache.cassandra.index.sai.disk.format.Version;
@@ -456,6 +457,146 @@ public class StorageAttachedIndexDDLTest extends SAITester
         Assertions.assertThatThrownBy(() -> createIndex("CREATE INDEX ON %s(" + column + ") USING 'sai' WITH OPTIONS = " + options))
                   .hasRootCauseInstanceOf(InvalidRequestException.class)
                   .hasRootCauseMessage(StorageAttachedIndex.ANALYSIS_ON_KEY_COLUMNS_MESSAGE + options);
+    }
+
+    @Test
+    public void shouldAcceptAnalyzerOptionsOnStringTypes()
+    {
+        createTable("CREATE TABLE %s (id text PRIMARY KEY, v1 text, v2 ascii)");
+
+        String v1Index = createIndex("CREATE INDEX ON %s(v1) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard', " +
+                                     "'query_analyzer' : 'standard', 'equals_behaviour_when_analyzed' : 'MATCH' }");
+        createIndex("CREATE INDEX ON %s(v2) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+
+        StorageAttachedIndex analyzed = (StorageAttachedIndex) getCurrentColumnFamilyStore().indexManager.getIndexByName(v1Index);
+        assertTrue(analyzed.hasLuceneAnalyzer());
+    }
+
+    @Test
+    public void shouldAcceptAnalyzerOnNonFrozenCollections()
+    {
+        createTable("CREATE TABLE %s (id text PRIMARY KEY, l list<text>, s set<text>, m map<text, text>)");
+
+        createIndex("CREATE INDEX ON %s(l) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        createIndex("CREATE INDEX ON %s(s) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        createIndex("CREATE INDEX ON %s(keys(m)) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        createIndex("CREATE INDEX ON %s(values(m)) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+    }
+
+    @Test
+    public void shouldRejectAnalyzerOnMapEntries()
+    {
+        createTable("CREATE TABLE %s (id text PRIMARY KEY, m map<text, text>)");
+
+        assertThatThrownBy(() -> executeNet("CREATE INDEX ON %s(entries(m)) USING 'sai' " +
+                                            "WITH OPTIONS = { 'index_analyzer' : 'standard' }"))
+        .isInstanceOf(InvalidQueryException.class)
+        .hasMessageContaining("cannot be analyzed");
+    }
+
+    @Test
+    public void shouldRejectAnalyzerOnFrozenCollection()
+    {
+        createTable("CREATE TABLE %s (id text PRIMARY KEY, l frozen<list<text>>)");
+
+        assertThatThrownBy(() -> executeNet("CREATE INDEX ON %s(full(l)) USING 'sai' " +
+                                            "WITH OPTIONS = { 'index_analyzer' : 'standard' }"))
+        .isInstanceOf(InvalidQueryException.class)
+        .hasMessageContaining("cannot be analyzed");
+    }
+
+    @Test
+    public void shouldRejectAnalyzerOnNonStringTypes()
+    {
+        createTable("CREATE TABLE %s (id text PRIMARY KEY, v1 int, v2 vector<float, 2>)");
+
+        assertThatThrownBy(() -> executeNet("CREATE INDEX ON %s(v1) USING 'sai' " +
+                                            "WITH OPTIONS = { 'index_analyzer' : 'standard' }"))
+        .isInstanceOf(InvalidQueryException.class)
+        .hasMessageContaining("cannot be analyzed");
+
+        assertThatThrownBy(() -> executeNet("CREATE INDEX ON %s(v2) USING 'sai' " +
+                                            "WITH OPTIONS = { 'index_analyzer' : 'standard' }"))
+        .isInstanceOf(InvalidQueryException.class)
+        .hasMessageContaining("cannot be analyzed");
+    }
+
+    @Test
+    public void shouldRejectAnalyzerOnPrimaryKeyColumns()
+    {
+        createTable("CREATE TABLE %s (k1 text, k2 text, c1 text, c2 text, PRIMARY KEY((k1, k2), c1, c2))");
+
+        for (String column : Arrays.asList("k1", "k2", "c1", "c2"))
+        {
+            assertRejectsAnalysisOnPrimaryKeyColumns(column, ImmutableMap.of("index_analyzer", "standard"));
+            assertRejectsAnalysisOnPrimaryKeyColumns(column, ImmutableMap.of("equals_behaviour_when_analyzed", "MATCH"));
+        }
+    }
+
+    @Test
+    public void shouldRejectQueryAnalyzerWithoutIndexAnalyzer()
+    {
+        createTable("CREATE TABLE %s (id text PRIMARY KEY, val text)");
+
+        assertThatThrownBy(() -> executeNet("CREATE INDEX ON %s(val) USING 'sai' " +
+                                            "WITH OPTIONS = { 'query_analyzer' : 'standard' }"))
+        .isInstanceOf(InvalidQueryException.class)
+        .hasMessageContaining("requires");
+    }
+
+    @Test
+    public void shouldRejectAnalyzerCombinedWithNonTokenizingOptions()
+    {
+        createTable("CREATE TABLE %s (id text PRIMARY KEY, val text)");
+
+        assertThatThrownBy(() -> executeNet("CREATE INDEX ON %s(val) USING 'sai' " +
+                                            "WITH OPTIONS = { 'index_analyzer' : 'standard', 'case_sensitive' : 'false' }"))
+        .isInstanceOf(InvalidQueryException.class)
+        .hasMessageContaining("cannot be combined");
+    }
+
+    @Test
+    public void shouldRejectUnknownAnalyzerConfigAtCreation()
+    {
+        createTable("CREATE TABLE %s (id text PRIMARY KEY, val text)");
+
+        assertThatThrownBy(() -> executeNet("CREATE INDEX ON %s(val) USING 'sai' " +
+                                            "WITH OPTIONS = { 'index_analyzer' : 'no_such_analyzer' }"))
+        .isInstanceOf(InvalidQueryException.class)
+        .hasMessageContaining("Unknown analyzer");
+    }
+
+    @Test
+    public void shouldRejectBadEqualsBehaviour()
+    {
+        createTable("CREATE TABLE %s (id text PRIMARY KEY, val text)");
+
+        assertThatThrownBy(() -> executeNet("CREATE INDEX ON %s(val) USING 'sai' " +
+                                            "WITH OPTIONS = { 'index_analyzer' : 'standard', " +
+                                            "'equals_behaviour_when_analyzed' : 'sometimes' }"))
+        .isInstanceOf(InvalidQueryException.class)
+        .hasMessageContaining("MATCH");
+
+        assertThatThrownBy(() -> executeNet("CREATE INDEX ON %s(val) USING 'sai' " +
+                                            "WITH OPTIONS = { 'equals_behaviour_when_analyzed' : 'MATCH' }"))
+        .isInstanceOf(InvalidQueryException.class)
+        .hasMessageContaining("requires");
+    }
+
+    @Test
+    public void equalsBehaviourDefaultsToUnsupported()
+    {
+        createTable("CREATE TABLE %s (id text PRIMARY KEY, v1 text, v2 text)");
+
+        String defaulted = createIndex("CREATE INDEX ON %s(v1) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        String match = createIndex("CREATE INDEX ON %s(v2) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard', " +
+                                   "'equals_behaviour_when_analyzed' : 'match' }");
+
+        SecondaryIndexManager indexManager = getCurrentColumnFamilyStore().indexManager;
+        assertEquals(EqualsBehaviourWhenAnalyzed.UNSUPPORTED,
+                     ((StorageAttachedIndex) indexManager.getIndexByName(defaulted)).equalsBehaviourWhenAnalyzed());
+        assertEquals(EqualsBehaviourWhenAnalyzed.MATCH,
+                     ((StorageAttachedIndex) indexManager.getIndexByName(match)).equalsBehaviourWhenAnalyzed());
     }
 
     @Test

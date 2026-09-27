@@ -28,6 +28,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.guardrails.Guardrails;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.utils.IndexIdentifier;
 import org.apache.cassandra.index.sai.utils.IndexTermType;
 import org.apache.cassandra.service.ClientState;
@@ -46,9 +47,19 @@ import org.apache.cassandra.utils.NoSpamLogger;
  */
 public final class AnalyzedTermLimits
 {
+    /**
+     * The bound on one row's analyzed collection elements. Element position bases advance by at
+     * least {@link LuceneTextAnalyzer#POSITION_GAP} per element, so this bound keeps every base
+     * within an int.
+     */
+    public static final int MAX_ELEMENTS_PER_ROW = Integer.MAX_VALUE / LuceneTextAnalyzer.POSITION_GAP;
+
     public static final String VALUE_DROPPED_MESSAGE = "Value in column '%s' for key '%s' breaches the analyzed " +
                                                        "term limits and the whole value was not indexed. " +
                                                        "(analyzed size: %s, tokens: %s)";
+
+    public static final String ELEMENT_COUNT_MESSAGE = "Row for key '%s' breaches the bound of %s analyzed " +
+                                                       "collection elements per row on column '%s'";
 
     private static final Logger logger = LoggerFactory.getLogger(AnalyzedTermLimits.class);
     private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 1, TimeUnit.MINUTES);
@@ -122,6 +133,37 @@ public final class AnalyzedTermLimits
             return false;
         }
         return true;
+    }
+
+    /**
+     * Bounds one row's analyzed collection elements at {@link #MAX_ELEMENTS_PER_ROW} so element
+     * position bases can never overflow an int. Client mutations breaching the bound are rejected,
+     * non client paths index the row's first {@link #MAX_ELEMENTS_PER_ROW} elements and drop each
+     * further value, counted and logged.
+     *
+     * @param elementOrdinal the zero based ordinal of the value within its row
+     * @param source lazy description of the value's key for messages, only read on a breach
+     * @param isClientMutation whether the value arrives in a client mutation
+     * @return true when the value may be indexed, false when a non client path must skip it
+     * @throws InvalidRequestException when a client mutation breaches the bound
+     */
+    public boolean validateElementOrdinal(int elementOrdinal, Supplier<String> source, boolean isClientMutation)
+    {
+        if (elementOrdinal < MAX_ELEMENTS_PER_ROW)
+            return true;
+
+        if (isClientMutation)
+            throw new InvalidRequestException(String.format(ELEMENT_COUNT_MESSAGE,
+                                                            source.get(),
+                                                            MAX_ELEMENTS_PER_ROW,
+                                                            indexTermType.columnName()));
+
+        countDroppedValue();
+        noSpamLogger.warn(indexIdentifier.logMessage(String.format(ELEMENT_COUNT_MESSAGE + " and its remaining values were not indexed",
+                                                                   source.get(),
+                                                                   MAX_ELEMENTS_PER_ROW,
+                                                                   indexTermType.columnName())));
+        return false;
     }
 
     public long droppedValueCount()

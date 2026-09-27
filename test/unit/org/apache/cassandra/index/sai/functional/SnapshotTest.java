@@ -23,12 +23,17 @@ import org.junit.Test;
 
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.index.sai.SAITester;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.index.sai.disk.format.IndexComponent;
+import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.utils.IndexIdentifier;
 import org.apache.cassandra.index.sai.utils.IndexTermType;
 import org.apache.cassandra.inject.Injections;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertTrue;
 
 public class SnapshotTest extends SAITester
 {
@@ -42,6 +47,38 @@ public class SnapshotTest extends SAITester
     public void resetCounters()
     {
         resetValidationCount();
+    }
+
+    @Test
+    public void shouldTakeAndRestoreSnapshotOfAnalyzedIndex() throws Throwable
+    {
+        createTable(CREATE_TABLE_TEMPLATE);
+        String indexName = createIndex("CREATE INDEX IF NOT EXISTS ON %s(v2) USING 'sai' " +
+                                       "WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        waitForTableIndexesQueryable();
+
+        // single lowercase token values keep '=' behaving identically on the analyzed index
+        execute("INSERT INTO %s (id1, v2) VALUES ('0', '0');");
+        flush();
+
+        String snapshot = "analyzed";
+        assertEquals(1, snapshot(snapshot));
+
+        truncate(false);
+        waitForAssert(this::verifyNoIndexFiles);
+
+        restoreSnapshot(snapshot);
+        assertNumRows(1, "SELECT * FROM %%s WHERE v2='0'");
+
+        // the version ab components, positions included, travel with the snapshot
+        StorageAttachedIndex index = (StorageAttachedIndex) getCurrentColumnFamilyStore().indexManager.getIndexByName(indexName);
+        for (SSTableReader sstable : getCurrentColumnFamilyStore().getLiveSSTables())
+        {
+            IndexDescriptor indexDescriptor = IndexDescriptor.create(sstable);
+            assertTrue(indexDescriptor.isPerColumnIndexBuildComplete(index.identifier()));
+            assertTrue(indexDescriptor.hasComponent(IndexComponent.POSITIONS, index.identifier()));
+        }
+        verifyIndexComponentsIncludedInSSTable();
     }
 
     @Test

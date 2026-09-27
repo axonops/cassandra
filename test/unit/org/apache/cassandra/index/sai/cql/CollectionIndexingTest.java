@@ -204,6 +204,38 @@ public class CollectionIndexingTest extends SAITester
         assertRows(execute("SELECT k, v, m FROM %s WHERE v = 1 AND m CONTAINS KEY 2 AND m CONTAINS 3"), row);
     }
 
+    @Test
+    public void indexAnalyzedSetPreAndPostFlush()
+    {
+        // single lowercase token elements keep CONTAINS behaving identically on the analyzed index
+        createTable("CREATE TABLE %s (pk int primary key, value set<text>)");
+        createIndex("CREATE INDEX ON %s(value) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        execute("INSERT INTO %s (pk, value) VALUES (1, {'apple', 'pie'})");
+        execute("INSERT INTO %s (pk, value) VALUES (2, {'banana'})");
+
+        assertEquals(1, execute("SELECT * FROM %s WHERE value CONTAINS 'apple'").size());
+        assertEquals(1, execute("SELECT * FROM %s WHERE value CONTAINS 'banana'").size());
+        flush();
+        assertEquals(1, execute("SELECT * FROM %s WHERE value CONTAINS 'apple'").size());
+        assertEquals(1, execute("SELECT * FROM %s WHERE value CONTAINS 'banana'").size());
+    }
+
+    @Test
+    public void indexAnalyzedSetPartialUpdateKeepsEarlierElements()
+    {
+        createTable("CREATE TABLE %s (pk int primary key, value set<text>)");
+        createIndex("CREATE INDEX ON %s(value) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        execute("INSERT INTO %s (pk, value) VALUES (1, {'apple'})");
+        // the partial update is its own mutation, the earlier element must stay queryable
+        execute("UPDATE %s SET value = value + {'pie'} WHERE pk = 1");
+
+        assertEquals(1, execute("SELECT * FROM %s WHERE value CONTAINS 'apple'").size());
+        assertEquals(1, execute("SELECT * FROM %s WHERE value CONTAINS 'pie'").size());
+        flush();
+        assertEquals(1, execute("SELECT * FROM %s WHERE value CONTAINS 'apple'").size());
+        assertEquals(1, execute("SELECT * FROM %s WHERE value CONTAINS 'pie'").size());
+    }
+
     private void createPopulatedMap(String createIndex)
     {
         createTable("CREATE TABLE %s (pk int primary key, value map<int, text>)");

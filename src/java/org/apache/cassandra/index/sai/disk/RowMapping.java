@@ -17,8 +17,12 @@
  */
 package org.apache.cassandra.index.sai.disk;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.NavigableMap;
 
 import javax.annotation.concurrent.NotThreadSafe;
 
@@ -28,8 +32,10 @@ import org.apache.cassandra.db.rows.RangeTombstoneMarker;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.tries.InMemoryTrie;
 import org.apache.cassandra.index.sai.memory.MemtableIndex;
+import org.apache.cassandra.index.sai.memory.TrieMemoryIndex;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.index.sai.utils.PrimaryKeys;
+import org.apache.cassandra.index.sai.utils.PrimaryKeysWithPositions;
 import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.utils.AbstractGuavaIterator;
 import org.apache.cassandra.utils.Pair;
@@ -52,6 +58,9 @@ public class RowMapping
     {
         @Override
         public Iterator<Pair<ByteComparable, LongArrayList>> merge(MemtableIndex index) { return Collections.emptyIterator(); }
+
+        @Override
+        public Iterator<Pair<ByteComparable, TermPostings>> mergeAnalyzed(MemtableIndex index, boolean isCollection) { return Collections.emptyIterator(); }
 
         @Override
         public void complete() {}
@@ -136,6 +145,69 @@ public class RowMapping
     }
 
     /**
+     * The analyzed variant of {@link #merge(MemtableIndex)}: the term to primary key mappings carry
+     * positions, so each term produces aligned row ids and per-posting position arrays.
+     * <p>
+     * For scalar columns, entries whose epoch is older than the primary key's newest epoch in the
+     * memtable's doc-length map are stale remnants of an overwritten value and are dropped. A
+     * collection column's older epochs are still live data from earlier partial updates, so
+     * collections keep add-only semantics.
+     *
+     * @param index a Memtable-attached column index with positions
+     * @param isCollection whether the index is over a non-frozen collection
+     *
+     * @return an iterator of term to {@link TermPostings} {@link Pair}s
+     */
+    public Iterator<Pair<ByteComparable, TermPostings>> mergeAnalyzed(MemtableIndex index, boolean isCollection)
+    {
+        assert complete : "RowMapping is not built.";
+
+        NavigableMap<PrimaryKey, TrieMemoryIndex.DocLength> docLengths = index.docLengths();
+        Iterator<Pair<ByteComparable, PrimaryKeys>> iterator = index.iterator();
+        return new AbstractGuavaIterator<>()
+        {
+            @Override
+            protected Pair<ByteComparable, TermPostings> computeNext()
+            {
+                while (iterator.hasNext())
+                {
+                    Pair<ByteComparable, PrimaryKeys> pair = iterator.next();
+
+                    TermPostings postings = null;
+                    Iterator<Map.Entry<PrimaryKey, PrimaryKeysWithPositions.PositionEntry>> entries =
+                        ((PrimaryKeysWithPositions) pair.right).entries();
+
+                    while (entries.hasNext())
+                    {
+                        Map.Entry<PrimaryKey, PrimaryKeysWithPositions.PositionEntry> entry = entries.next();
+
+                        // The in-memory index does not handle deletions, so it is possible to
+                        // have a primary key in the index that doesn't exist in the row mapping
+                        Long sstableRowId = rowMapping.get(entry.getKey());
+                        if (sstableRowId == null)
+                            continue;
+
+                        // A scalar overwrite fully replaces the value, so an older epoch proves the
+                        // term is stale for this key
+                        if (!isCollection)
+                        {
+                            TrieMemoryIndex.DocLength docLength = docLengths.get(entry.getKey());
+                            if (docLength == null || docLength.epoch != entry.getValue().epoch())
+                                continue;
+                        }
+
+                        postings = postings == null ? new TermPostings() : postings;
+                        postings.add(sstableRowId, entry.getValue().positions());
+                    }
+                    if (postings != null)
+                        return Pair.create(pair.left, postings);
+                }
+                return endOfData();
+            }
+        };
+    }
+
+    /**
      * Complete building in memory RowMapping, mark it as immutable.
      */
     public void complete()
@@ -169,5 +241,26 @@ public class RowMapping
     {
         Long sstableRowId = rowMapping.get(key);
         return sstableRowId == null ? -1 : Math.toIntExact(sstableRowId);
+    }
+
+    /**
+     * One term's postings from an analyzed memtable index: sstable row ids in ascending order with
+     * the aligned per-posting position arrays
+     */
+    public static class TermPostings
+    {
+        public final LongArrayList rowIds = new LongArrayList();
+        public final List<int[]> positions = new ArrayList<>();
+
+        void add(long rowId, int[] postingPositions)
+        {
+            rowIds.add(rowId);
+            positions.add(postingPositions);
+        }
+
+        public int size()
+        {
+            return rowIds.size();
+        }
     }
 }

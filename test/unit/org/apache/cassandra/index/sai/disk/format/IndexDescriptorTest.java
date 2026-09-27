@@ -37,6 +37,7 @@ import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.util.File;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 public class IndexDescriptorTest
@@ -84,6 +85,29 @@ public class IndexDescriptorTest
 
         assertEquals(Version.AA, indexDescriptor.version);
         assertTrue(indexDescriptor.hasComponent(IndexComponent.COLUMN_COMPLETION_MARKER, indexIdentifier));
+    }
+
+    @Test
+    public void analyzedIndexComponentIsResolvedUnderItsOwnVersion() throws Throwable
+    {
+        // the sstable's own components stay on version aa while the analyzed index's per-column
+        // components live side by side under version ab
+        createFileOnDisk("-SAI+aa+GroupComplete.db");
+        createFileOnDisk("-SAI+aa+plain_index+ColumnComplete.db");
+        createFileOnDisk("-SAI+ab+analyzed_index+ColumnComplete.db");
+        createFileOnDisk("-SAI+ab+analyzed_index+Positions.db");
+
+        IndexDescriptor indexDescriptor = IndexDescriptor.create(descriptor, Murmur3Partitioner.instance, SAITester.EMPTY_COMPARATOR);
+        IndexIdentifier plainIdentifier = SAITester.createIndexIdentifier("test", "test", "plain_index");
+        IndexIdentifier analyzedIdentifier = new IndexIdentifier("test", "test", "analyzed_index", Version.AB);
+
+        assertEquals(Version.AA, indexDescriptor.version);
+        assertEquals(Version.AA, indexDescriptor.perIndexVersion(plainIdentifier));
+        assertEquals(Version.AB, indexDescriptor.perIndexVersion(analyzedIdentifier));
+        assertTrue(indexDescriptor.hasComponent(IndexComponent.COLUMN_COMPLETION_MARKER, plainIdentifier));
+        assertTrue(indexDescriptor.hasComponent(IndexComponent.COLUMN_COMPLETION_MARKER, analyzedIdentifier));
+        assertTrue(indexDescriptor.hasComponent(IndexComponent.POSITIONS, analyzedIdentifier));
+        assertFalse(indexDescriptor.hasComponent(IndexComponent.POSITIONS, plainIdentifier));
     }
 
     private void createFileOnDisk(String filename) throws Throwable

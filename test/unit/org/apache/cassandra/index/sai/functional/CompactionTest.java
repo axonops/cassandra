@@ -162,6 +162,42 @@ public class CompactionTest extends SAITester
     }
 
     @Test
+    public void testConcurrentQueryWithCompactionOnAnalyzedIndex()
+    {
+        createTable(CREATE_TABLE_TEMPLATE);
+        IndexIdentifier analyzedIndexIdentifier =
+            createIndexIdentifier(createIndex("CREATE INDEX IF NOT EXISTS ON %s(v2) USING 'sai' " +
+                                              "WITH OPTIONS = { 'index_analyzer' : 'standard' }"));
+        waitForTableIndexesQueryable();
+
+        int num = 10;
+        for (int i = 0; i < num; i++)
+        {
+            // single lowercase token values keep '=' behaving identically on the analyzed index
+            execute("INSERT INTO %s (id1, v2) VALUES (?, '0')", Integer.toString(i));
+            flush();
+        }
+
+        TestWithConcurrentVerification compactionTest = new TestWithConcurrentVerification(() -> {
+            for (int i = 0; i < 30; i++)
+            {
+                try
+                {
+                    assertNumRows(num, "SELECT id1 FROM %s WHERE v2='0'");
+                }
+                catch (Throwable e)
+                {
+                    throw new RuntimeException(e);
+                }
+            }
+        }, this::upgradeSSTables);
+
+        compactionTest.start();
+
+        verifySSTableIndexes(analyzedIndexIdentifier, num);
+    }
+
+    @Test
     public void testAbortCompactionWithEarlyOpenSSTables() throws Throwable
     {
         createTable(CREATE_TABLE_TEMPLATE);

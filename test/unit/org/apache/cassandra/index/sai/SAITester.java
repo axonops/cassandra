@@ -260,6 +260,11 @@ public abstract class SAITester extends CQLTester
 
     public static StorageAttachedIndex createMockIndex(ColumnMetadata column)
     {
+        return createMockIndex(column, new HashMap<>());
+    }
+
+    public static StorageAttachedIndex createMockIndex(ColumnMetadata column, Map<String, String> extraOptions)
+    {
         TableMetadata table = TableMetadata.builder(column.ksName, column.cfName)
                                            .addPartitionKeyColumn("pk", Int32Type.instance)
                                            .addRegularColumn(column.name, column.type)
@@ -267,7 +272,7 @@ public abstract class SAITester extends CQLTester
                                            .caching(CachingParams.CACHE_NOTHING)
                                            .build();
 
-        Map<String, String> options = new HashMap<>();
+        Map<String, String> options = new HashMap<>(extraOptions);
         options.put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, StorageAttachedIndex.class.getCanonicalName());
         options.put("target", column.name.toString());
 

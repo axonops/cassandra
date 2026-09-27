@@ -29,6 +29,7 @@ import org.junit.rules.ExpectedException;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.utils.IndexIdentifier;
 import org.apache.cassandra.index.sai.postings.PostingList;
+import org.apache.cassandra.index.sai.postings.PostingListWithPositions;
 import org.apache.cassandra.index.sai.disk.format.IndexComponent;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.metrics.QueryEventListener;
@@ -190,6 +191,86 @@ public class PostingsTest extends SAIRandomizedTester
                 assertEquals(1, listener.advances);
             }
         }
+    }
+
+    @Test
+    public void testPostingsWithPositionsStayReaderCompatible() throws Exception
+    {
+        final long[] postings = { 10, 20, 30, 40, 50, 60 };
+        final ArrayPostingList expectedPostingList = new ArrayPostingList(postings);
+
+        long plainLength;
+        try (PostingsWriter writer = new PostingsWriter(indexDescriptor, indexIdentifier))
+        {
+            writer.write(new ArrayPostingList(postings));
+            writer.complete();
+            plainLength = writer.getFilePointer();
+        }
+
+        // an analyzed index writes the same postings through a PositionsWriter, adding only the
+        // trailing positions summary offset VLong to each postings summary
+        IndexDescriptor analyzedDescriptor = newIndexDescriptor();
+        IndexIdentifier analyzedIdentifier = SAITester.createIndexIdentifier(analyzedDescriptor.sstableDescriptor.ksname,
+                                                                             analyzedDescriptor.sstableDescriptor.cfname,
+                                                                             newIndex());
+        long postingPointer;
+        long analyzedLength;
+        try (PositionsWriter positionsWriter = new PositionsWriter(analyzedDescriptor, analyzedIdentifier);
+             PostingsWriter writer = new PostingsWriter(analyzedDescriptor, analyzedIdentifier, positionsWriter))
+        {
+            postingPointer = writer.write(postingListWithPositions(postings));
+            positionsWriter.writeDocLengths(new int[]{ 1 });
+            positionsWriter.complete();
+            writer.complete();
+            analyzedLength = writer.getFilePointer();
+        }
+
+        assertTrue(analyzedLength > plainLength);
+
+        IndexInput input = analyzedDescriptor.openPerIndexInput(IndexComponent.POSTING_LISTS, analyzedIdentifier);
+        SAICodecUtils.validate(input);
+        input.seek(postingPointer);
+
+        final PostingsReader.BlocksSummary summary = new PostingsReader.BlocksSummary(input, input.getFilePointer());
+        assertEquals(expectedPostingList.size(), summary.numPostings);
+
+        CountingPostingListEventListener listener = new CountingPostingListEventListener();
+        try (PostingsReader reader = new PostingsReader(input, postingPointer, listener))
+        {
+            expectedPostingList.reset();
+            assertPostingListEquals(expectedPostingList, reader);
+        }
+    }
+
+    private PostingListWithPositions postingListWithPositions(long[] postings)
+    {
+        final ArrayPostingList delegate = new ArrayPostingList(postings);
+        return new PostingListWithPositions()
+        {
+            @Override
+            public long nextPosting()
+            {
+                return delegate.nextPosting();
+            }
+
+            @Override
+            public int[] positionsForCurrentPosting()
+            {
+                return new int[]{ 0 };
+            }
+
+            @Override
+            public long size()
+            {
+                return delegate.size();
+            }
+
+            @Override
+            public long advance(long targetRowID)
+            {
+                return delegate.advance(targetRowID);
+            }
+        };
     }
 
     @Test

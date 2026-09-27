@@ -74,7 +74,24 @@ public class MemtableIndexManager
 
         long bytes = 0;
 
-        if (index.termType().isNonFrozenCollection())
+        if (index.hasLuceneAnalyzer())
+        {
+            // The analyzed write path is row scoped: all of the row's values in one call, so
+            // collection elements get disjoint position spaces and the doc length is complete
+            if (index.termType().isNonFrozenCollection())
+            {
+                Iterator<ByteBuffer> bufferIterator = index.termType().valuesOf(row, FBUtilities.nowInSeconds());
+                if (bufferIterator != null && bufferIterator.hasNext())
+                    bytes += target.indexAnalyzedRow(key, row.clustering(), bufferIterator);
+            }
+            else
+            {
+                ByteBuffer value = index.termType().valueOf(key, row, FBUtilities.nowInSeconds());
+                if (value != null)
+                    bytes += target.indexAnalyzedRow(key, row.clustering(), Collections.singletonList(value).iterator());
+            }
+        }
+        else if (index.termType().isNonFrozenCollection())
         {
             Iterator<ByteBuffer> bufferIterator = index.termType().valuesOf(row, FBUtilities.nowInSeconds());
             if (bufferIterator != null)

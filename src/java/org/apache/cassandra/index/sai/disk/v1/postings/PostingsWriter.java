@@ -20,6 +20,7 @@ package org.apache.cassandra.index.sai.disk.v1.postings;
 
 import java.io.Closeable;
 import java.io.IOException;
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -28,10 +29,12 @@ import org.agrona.collections.LongArrayList;
 import org.apache.cassandra.index.sai.disk.ResettableByteBuffersIndexOutput;
 import org.apache.cassandra.index.sai.disk.format.IndexComponent;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
+import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.utils.IndexIdentifier;
 import org.apache.cassandra.index.sai.disk.io.IndexOutputWriter;
 import org.apache.cassandra.index.sai.disk.v1.SAICodecUtils;
 import org.apache.cassandra.index.sai.postings.PostingList;
+import org.apache.cassandra.index.sai.postings.PostingListWithPositions;
 import org.apache.lucene.store.DataOutput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.packed.DirectWriter;
@@ -96,6 +99,8 @@ public class PostingsWriter implements Closeable
     private final LongArrayList blockOffsets = new LongArrayList();
     private final LongArrayList blockMaximumPostings = new LongArrayList();
     private final ResettableByteBuffersIndexOutput inMemoryOutput = new ResettableByteBuffersIndexOutput("blockOffsets");
+    @Nullable
+    private final PositionsWriter positionsWriter;
 
     private final long startOffset;
 
@@ -108,6 +113,16 @@ public class PostingsWriter implements Closeable
     public PostingsWriter(IndexDescriptor indexDescriptor, IndexIdentifier indexIdentifier) throws IOException
     {
         this(indexDescriptor, indexIdentifier, BLOCK_SIZE);
+    }
+
+    /**
+     * Constructor for the analyzed write path. Positions of each written posting are forwarded to
+     * the given {@link PositionsWriter} and every postings summary gains one trailing VLong holding
+     * the term's positions summary offset, the format version ab extension.
+     */
+    public PostingsWriter(IndexDescriptor indexDescriptor, IndexIdentifier indexIdentifier, PositionsWriter positionsWriter) throws IOException
+    {
+        this(indexDescriptor.openPerIndexOutput(IndexComponent.POSTING_LISTS, indexIdentifier, true), BLOCK_SIZE, positionsWriter);
     }
 
     public PostingsWriter(IndexOutputWriter dataOutput) throws IOException
@@ -123,11 +138,20 @@ public class PostingsWriter implements Closeable
 
     private PostingsWriter(IndexOutputWriter dataOutput, int blockSize) throws IOException
     {
+        this(dataOutput, blockSize, null);
+    }
+
+    private PostingsWriter(IndexOutputWriter dataOutput, int blockSize, PositionsWriter positionsWriter) throws IOException
+    {
         this.blockSize = blockSize;
         this.dataOutput = dataOutput;
+        this.positionsWriter = positionsWriter;
         startOffset = dataOutput.getFilePointer();
         deltaBuffer = new long[blockSize];
-        SAICodecUtils.writeHeader(dataOutput);
+        if (positionsWriter == null)
+            SAICodecUtils.writeHeader(dataOutput);
+        else
+            SAICodecUtils.writeHeader(dataOutput, Version.AB);
     }
 
     /**
@@ -184,6 +208,8 @@ public class PostingsWriter implements Closeable
         while ((posting = postings.nextPosting()) != PostingList.END_OF_STREAM)
         {
             writePosting(posting);
+            if (positionsWriter != null)
+                positionsWriter.addPositions(((PostingListWithPositions) postings).positionsForCurrentPosting());
             size++;
             totalPostings++;
         }
@@ -192,8 +218,12 @@ public class PostingsWriter implements Closeable
 
         finish();
 
+        long positionsSummaryOffset = positionsWriter == null ? -1 : positionsWriter.completeTerm();
+
         final long summaryOffset = dataOutput.getFilePointer();
         writeSummary(size);
+        if (positionsWriter != null)
+            dataOutput.writeVLong(positionsSummaryOffset);
         return summaryOffset;
     }
 

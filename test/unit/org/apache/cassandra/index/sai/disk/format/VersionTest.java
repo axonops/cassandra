@@ -21,9 +21,12 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.index.sai.disk.v2.V2OnDiskFormat;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 public class VersionTest
 {
@@ -37,14 +40,30 @@ public class VersionTest
     public void supportedVersionsWillParse()
     {
         assertEquals(Version.AA, Version.parse("aa"));
+        assertEquals(Version.AB, Version.parse("ab"));
     }
 
     @Test
     public void unsupportedOrInvalidVersionsDoNotParse()
     {
         assertThatThrownBy(() -> Version.parse(null)).isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> Version.parse("ab")).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> Version.parse("zz")).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> Version.parse("a")).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> Version.parse("abc")).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    public void analyzedVersionOrdersAfterStockVersion()
+    {
+        assertTrue(Version.AB.onOrAfter(Version.AA));
+        assertFalse(Version.AA.onOrAfter(Version.AB));
+    }
+
+    @Test
+    public void latestVersionStaysStock()
+    {
+        // Only indexes with an index_analyzer write version ab, everything else keeps the default
+        assertEquals(Version.AA, Version.LATEST);
+        assertEquals(V2OnDiskFormat.instance, Version.AB.onDiskFormat());
     }
 }

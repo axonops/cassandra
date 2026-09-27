@@ -28,6 +28,7 @@ import com.google.common.base.Objects;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.index.sai.disk.v1.V1OnDiskFormat;
+import org.apache.cassandra.index.sai.disk.v2.V2OnDiskFormat;
 import org.apache.cassandra.index.sai.utils.IndexIdentifier;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
@@ -43,11 +44,14 @@ public class Version implements Comparable<Version>
 
     // Current version
     public static final Version AA = new Version("aa", V1OnDiskFormat.instance, (c, i) -> defaultFileNameFormat(c, i, "aa"));
+    // Version written only by indexes with an index_analyzer option. Everything else keeps writing AA.
+    public static final Version AB = new Version("ab", V2OnDiskFormat.instance, (c, i) -> defaultFileNameFormat(c, i, "ab"));
 
     // These should be added in reverse order so that the latest version is used first. Version matching tests
     // are more likely to match the latest version, so we want to test that one first.
     public static final SortedSet<Version> ALL = new TreeSet<>(Comparator.reverseOrder()) {{
         add(AA);
+        add(AB);
     }};
 
     public static final Version EARLIEST = AA;

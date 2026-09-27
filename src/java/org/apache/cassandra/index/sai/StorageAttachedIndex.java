@@ -82,6 +82,11 @@ import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexRegistry;
 import org.apache.cassandra.index.TargetParser;
 import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
+import org.apache.cassandra.index.sai.analyzer.AnalyzedTermLimits;
+import org.apache.cassandra.index.sai.analyzer.AnalyzedToken;
+import org.apache.cassandra.index.sai.analyzer.AnalyzerConfig;
+import org.apache.cassandra.index.sai.analyzer.EqualsBehaviourWhenAnalyzed;
+import org.apache.cassandra.index.sai.analyzer.LuceneTextAnalyzer;
 import org.apache.cassandra.index.sai.analyzer.NonTokenizingOptions;
 import org.apache.cassandra.index.sai.disk.SSTableIndex;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
@@ -157,7 +162,10 @@ public class StorageAttachedIndex implements Index
                                                                      IndexWriterConfig.OPTIMIZE_FOR,
                                                                      NonTokenizingOptions.CASE_SENSITIVE,
                                                                      NonTokenizingOptions.NORMALIZE,
-                                                                     NonTokenizingOptions.ASCII);
+                                                                     NonTokenizingOptions.ASCII,
+                                                                     AnalyzerConfig.INDEX_ANALYZER_OPTION,
+                                                                     AnalyzerConfig.QUERY_ANALYZER_OPTION,
+                                                                     EqualsBehaviourWhenAnalyzed.OPTION);
 
     public static final Set<CQL3Type> SUPPORTED_TYPES = ImmutableSet.of(CQL3Type.Native.ASCII, CQL3Type.Native.BIGINT, CQL3Type.Native.DATE,
                                                                         CQL3Type.Native.DOUBLE, CQL3Type.Native.FLOAT, CQL3Type.Native.INT,
@@ -177,6 +185,10 @@ public class StorageAttachedIndex implements Index
     private final ColumnQueryMetrics columnQueryMetrics;
     private final IndexWriterConfig indexWriterConfig;
     @Nullable private final AbstractAnalyzer.AnalyzerFactory analyzerFactory;
+    @Nullable private final LuceneTextAnalyzer luceneIndexAnalyzer;
+    @Nullable private final LuceneTextAnalyzer luceneQueryAnalyzer;
+    @Nullable private final AnalyzedTermLimits analyzedTermLimits;
+    private final EqualsBehaviourWhenAnalyzed equalsBehaviourWhenAnalyzed;
     private final PrimaryKey.Factory primaryKeyFactory;
     private final MemtableIndexManager memtableIndexManager;
     private final IndexMetrics indexMetrics;
@@ -195,13 +207,24 @@ public class StorageAttachedIndex implements Index
         TableMetadata tableMetadata = baseCfs.metadata();
         Pair<ColumnMetadata, IndexTarget.Type> target = TargetParser.parse(tableMetadata, indexMetadata);
         indexTermType = IndexTermType.create(target.left, tableMetadata.partitionKeyColumns(), target.right);
-        indexIdentifier = new IndexIdentifier(baseCfs.getKeyspaceName(), baseCfs.getTableName(), indexMetadata.name);
+        AnalyzerConfig.Configs analyzerConfigs = AnalyzerConfig.fromIndexOptions(indexTermType, indexMetadata.options);
+        // An index with an index_analyzer writes and reads its per-column components with format version ab.
+        // Everything else keeps the stock version of the owning sstable.
+        indexIdentifier = new IndexIdentifier(baseCfs.getKeyspaceName(), baseCfs.getTableName(), indexMetadata.name,
+                                              analyzerConfigs == null ? null : Version.AB);
         primaryKeyFactory = new PrimaryKey.Factory(tableMetadata.partitioner, tableMetadata.comparator);
         indexWriterConfig = IndexWriterConfig.fromOptions(indexMetadata.name, indexTermType, indexMetadata.options);
         viewManager = new IndexViewManager(this);
         columnQueryMetrics = indexTermType.isLiteral() ? new ColumnQueryMetrics.TrieIndexMetrics(indexIdentifier)
                                                        : new ColumnQueryMetrics.BalancedTreeIndexMetrics(indexIdentifier);
         analyzerFactory = AbstractAnalyzer.fromOptions(indexTermType, indexMetadata.options);
+        luceneIndexAnalyzer = analyzerConfigs == null ? null : new LuceneTextAnalyzer(analyzerConfigs.indexConfig, indexTermType);
+        luceneQueryAnalyzer = analyzerConfigs == null ? null
+                                                      : analyzerConfigs.queryConfig == null
+                                                        ? luceneIndexAnalyzer
+                                                        : new LuceneTextAnalyzer(analyzerConfigs.queryConfig, indexTermType);
+        analyzedTermLimits = analyzerConfigs == null ? null : new AnalyzedTermLimits(indexIdentifier, indexTermType);
+        equalsBehaviourWhenAnalyzed = EqualsBehaviourWhenAnalyzed.fromOptions(indexMetadata.options);
         memtableIndexManager = new MemtableIndexManager(this);
         indexMetrics = new IndexMetrics(this, memtableIndexManager);
         maxTermSizeGuardrail = indexTermType.isVector()
@@ -275,6 +298,9 @@ public class StorageAttachedIndex implements Index
 
         IndexTermType indexTermType = IndexTermType.create(target.left, metadata.partitionKeyColumns(), target.right);
         AbstractAnalyzer.fromOptions(indexTermType, analysisOptions);
+        // Parsing builds both analyzers eagerly, so a bad analyzer config fails DDL, not first write
+        AnalyzerConfig.fromIndexOptions(indexTermType, analysisOptions);
+        EqualsBehaviourWhenAnalyzed.fromOptions(analysisOptions);
         IndexWriterConfig config = IndexWriterConfig.fromOptions(null, indexTermType, options);
 
         // If we are indexing map entries we need to validate the subtypes
@@ -386,6 +412,10 @@ public class StorageAttachedIndex implements Index
             viewManager.invalidate();
             if (analyzerFactory != null)
                 analyzerFactory.close();
+            if (luceneIndexAnalyzer != null)
+                luceneIndexAnalyzer.close();
+            if (luceneQueryAnalyzer != null && luceneQueryAnalyzer != luceneIndexAnalyzer)
+                luceneQueryAnalyzer.close();
             columnQueryMetrics.release();
             memtableIndexManager.invalidate();
             indexMetrics.release();
@@ -546,11 +576,12 @@ public class StorageAttachedIndex implements Index
     @Override
     public Set<Component> getComponents()
     {
-        return Version.LATEST.onDiskFormat()
-                             .perColumnIndexComponents(indexTermType)
-                             .stream()
-                             .map(c -> Version.LATEST.makePerIndexComponent(c, indexIdentifier))
-                             .collect(Collectors.toSet());
+        Version version = indexIdentifier.version != null ? indexIdentifier.version : Version.LATEST;
+        return version.onDiskFormat()
+                      .perColumnIndexComponents(indexTermType)
+                      .stream()
+                      .map(c -> version.makePerIndexComponent(c, indexIdentifier))
+                      .collect(Collectors.toSet());
     }
 
     @Override
@@ -683,6 +714,38 @@ public class StorageAttachedIndex implements Index
         return analyzerFactory.create();
     }
 
+    /**
+     * Returns true when the index has an {@code index_analyzer} option and uses the Lucene analyzer
+     * write path with positions. Mutually exclusive with {@link #hasAnalyzer()}.
+     */
+    public boolean hasLuceneAnalyzer()
+    {
+        return luceneIndexAnalyzer != null;
+    }
+
+    public LuceneTextAnalyzer luceneIndexAnalyzer()
+    {
+        assert luceneIndexAnalyzer != null : "Index does not have an index_analyzer";
+        return luceneIndexAnalyzer;
+    }
+
+    public LuceneTextAnalyzer luceneQueryAnalyzer()
+    {
+        assert luceneQueryAnalyzer != null : "Index does not have an index_analyzer";
+        return luceneQueryAnalyzer;
+    }
+
+    public AnalyzedTermLimits analyzedTermLimits()
+    {
+        assert analyzedTermLimits != null : "Index does not have an index_analyzer";
+        return analyzedTermLimits;
+    }
+
+    public EqualsBehaviourWhenAnalyzed equalsBehaviourWhenAnalyzed()
+    {
+        return equalsBehaviourWhenAnalyzed;
+    }
+
     public IndexMetrics indexMetrics()
     {
         return indexMetrics;
@@ -733,7 +796,8 @@ public class StorageAttachedIndex implements Index
      */
     public int openPerColumnIndexFiles()
     {
-        return viewManager.view().size() * Version.LATEST.onDiskFormat().openFilesPerColumnIndex();
+        Version version = indexIdentifier.version != null ? indexIdentifier.version : Version.LATEST;
+        return viewManager.view().size() * version.onDiskFormat().openFilesPerColumnIndex();
     }
 
     /**
@@ -776,8 +840,15 @@ public class StorageAttachedIndex implements Index
         if (indexTermType.isNonFrozenCollection())
         {
             Iterator<ByteBuffer> bufferIterator = indexTermType.valuesOf(row, FBUtilities.nowInSeconds());
+            int element = 0;
             while (bufferIterator != null && bufferIterator.hasNext())
-                validateTermSizeForCell(analyzer, key, bufferIterator.next(), isClientMutation, state);
+            {
+                ByteBuffer cellBuffer = bufferIterator.next();
+                if (hasLuceneAnalyzer() && !analyzedTermLimits.validateElementOrdinal(element++, key::toString, isClientMutation))
+                    continue;
+
+                validateTermSizeForCell(analyzer, key, cellBuffer, isClientMutation, state);
+            }
         }
         else
         {
@@ -790,6 +861,15 @@ public class StorageAttachedIndex implements Index
     {
         if (cellBuffer == null || cellBuffer.remaining() == 0)
             return;
+
+        if (hasLuceneAnalyzer())
+        {
+            // The raw cell size proves nothing about the analyzed output size, so the whole value is
+            // analyzed and judged by the single limits rule shared with the memtable and compaction paths
+            List<AnalyzedToken> tokens = luceneIndexAnalyzer.analyze(cellBuffer.duplicate());
+            analyzedTermLimits.validate(tokens, key::toString, isClientMutation, state);
+            return;
+        }
 
         // analyzer should not return terms that are larger than the origin value.
         if (!maxTermSizeGuardrail.warnsOn(cellBuffer.remaining(), null))

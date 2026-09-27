@@ -61,6 +61,12 @@ public enum IndexComponent
     POSTING_LISTS("PostingLists"),
 
     /**
+     * Stores per-posting token positions and per-segment document lengths for analyzed indexes,
+     * written by {@link org.apache.cassandra.index.sai.disk.v1.postings.PositionsWriter}
+     */
+    POSITIONS("Positions"),
+
+    /**
      * If present indicates that the column index build completed successfully
      */
     COLUMN_COMPLETION_MARKER("ColumnComplete"),

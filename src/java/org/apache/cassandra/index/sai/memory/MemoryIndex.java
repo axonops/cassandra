@@ -37,6 +37,7 @@ import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Iterator;
+import java.util.NavigableMap;
 import java.util.function.Function;
 
 public abstract class MemoryIndex implements MemtableOrdering
@@ -49,6 +50,24 @@ public abstract class MemoryIndex implements MemtableOrdering
     }
 
     public abstract long add(DecoratedKey key, Clustering<?> clustering, ByteBuffer value);
+
+    /**
+     * Adds one row's analyzed values, whole row per call. Only supported by {@link TrieMemoryIndex}
+     * for indexes with an {@code index_analyzer} option.
+     */
+    public long indexAnalyzedRow(DecoratedKey key, Clustering<?> clustering, Iterator<ByteBuffer> values)
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * The newest epoch and token count per primary key. Only supported by {@link TrieMemoryIndex}
+     * for indexes with an {@code index_analyzer} option.
+     */
+    public NavigableMap<PrimaryKey, TrieMemoryIndex.DocLength> docLengths()
+    {
+        throw new UnsupportedOperationException();
+    }
 
     public abstract long update(DecoratedKey key, Clustering<?> clustering, ByteBuffer oldValue, ByteBuffer newValue);
 

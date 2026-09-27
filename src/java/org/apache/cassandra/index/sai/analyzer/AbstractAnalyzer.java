@@ -109,8 +109,15 @@ public abstract class AbstractAnalyzer implements Iterator<ByteBuffer>
     public static Map<String, String> getAnalyzerOptions(Map<String, String> options)
     {
         return options.entrySet().stream()
-                      .filter(e -> NonTokenizingOptions.hasOption(e.getKey()))
+                      .filter(e -> NonTokenizingOptions.hasOption(e.getKey()) || isLuceneAnalyzerOption(e.getKey()))
                       .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+    }
+
+    private static boolean isLuceneAnalyzerOption(String option)
+    {
+        return option.equals(AnalyzerConfig.INDEX_ANALYZER_OPTION) ||
+               option.equals(AnalyzerConfig.QUERY_ANALYZER_OPTION) ||
+               option.equals(EqualsBehaviourWhenAnalyzed.OPTION);
     }
 
 }

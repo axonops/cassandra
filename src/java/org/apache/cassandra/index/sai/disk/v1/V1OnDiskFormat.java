@@ -108,6 +108,7 @@ public class V1OnDiskFormat implements OnDiskFormat
      */
     private static final Set<IndexComponent> SEGMENTED_COMPONENTS = EnumSet.of(IndexComponent.BALANCED_TREE,
                                                                                IndexComponent.POSTING_LISTS,
+                                                                               IndexComponent.POSITIONS,
                                                                                IndexComponent.TERMS_DATA,
                                                                                IndexComponent.COMPRESSED_VECTORS);
 
@@ -185,7 +186,8 @@ public class V1OnDiskFormat implements OnDiskFormat
                                        index.termType(),
                                        index.identifier(),
                                        index.indexMetrics(),
-                                       rowMapping);
+                                       rowMapping,
+                                       index.hasLuceneAnalyzer());
     }
 
     @Override

@@ -36,6 +36,24 @@ import org.assertj.core.api.Assertions;
 
 public class NodeRestartTest extends SAITester
 {
+    @Test
+    public void shouldRestartWithAnalyzedIndex() throws Throwable
+    {
+        createTable(CREATE_TABLE_TEMPLATE);
+        IndexIdentifier indexIdentifier =
+            createIndexIdentifier(createIndex("CREATE INDEX IF NOT EXISTS ON %s(v2) USING 'sai' " +
+                                              "WITH OPTIONS = { 'index_analyzer' : 'standard' }"));
+        // single lowercase token values keep '=' behaving identically on the analyzed index
+        execute("INSERT INTO %s (id1, v2) VALUES ('0', '0')");
+        flush();
+
+        // restart discovery finds the version ab per-column components and validates their frames
+        simulateNodeRestart();
+
+        verifySSTableIndexes(indexIdentifier, 1);
+        assertNumRows(1, "SELECT * FROM %%s WHERE v2='0'");
+    }
+
     // Failure during the pre-join and initialization tasks shouldn't fail node restart.
     @Test
     public void shouldSurviveRestartWithPreJoinAndInitFailures() throws Throwable

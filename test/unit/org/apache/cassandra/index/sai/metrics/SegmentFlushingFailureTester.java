@@ -168,6 +168,30 @@ public abstract class SegmentFlushingFailureTester extends SAITester
     }
 
     @Test
+    public void shouldZeroMemoryTrackerOnAnalyzedSegmentFlushFailure() throws Throwable
+    {
+        createTable(CREATE_TABLE_TEMPLATE);
+        createIndex("CREATE INDEX IF NOT EXISTS ON %s(v2) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+
+        assertEquals(expectedBytesLimit(), getSegmentBufferSpaceLimit());
+        assertEquals("Segment buffer memory tracker should start at zero!", 0L, getSegmentBufferUsedBytes());
+        assertEquals("There should be no segment builders in progress.", 0L, getColumnIndexBuildsInProgress());
+
+        execute("INSERT INTO %s (id1, v1, v2) VALUES ('0', 0, '0')");
+        flush();
+        execute("INSERT INTO %s (id1, v1, v2) VALUES ('1', 1, '1')");
+        flush();
+
+        // Verify that the abort path also releases the positions and doc-length bytes charged by
+        // the analyzed builder:
+        verifyCompactionIndexBuilds(1, segmentFlushFailure, currentTable());
+
+        // We should still be able to query the index if compaction is aborted:
+        ResultSet rows = executeNet("SELECT * FROM %s WHERE v2 = '0'");
+        assertEquals(1, rows.all().size());
+    }
+
+    @Test
     public void shouldZeroMemoryAfterConcurrentIndexFailures() throws Throwable
     {
         String table1 = createTable(CREATE_TABLE_TEMPLATE);

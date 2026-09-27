@@ -24,12 +24,18 @@ import org.junit.Test;
 
 import com.datastax.driver.core.ResultSet;
 import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.index.sai.IndexValidation;
 import org.apache.cassandra.index.sai.SAITester;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.index.sai.disk.format.IndexComponent;
+import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.utils.IndexIdentifier;
 import org.apache.cassandra.index.sai.disk.v1.bbtree.NumericIndexWriter;
 import org.apache.cassandra.index.sai.utils.IndexTermType;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 public class FlushingTest extends SAITester
 {
@@ -77,5 +83,31 @@ public class FlushingTest extends SAITester
         rows = executeNet("SELECT id1 FROM %s WHERE v1 >= 0");
         assertEquals(0, rows.all().size());
         verifySSTableIndexes(indexIdentifier, 1, 0, 1);
+    }
+
+    @Test
+    public void testFlushingAnalyzedIndexWritesAnalyzedComponents()
+    {
+        createTable(CREATE_TABLE_TEMPLATE);
+        String indexName = createIndex("CREATE INDEX IF NOT EXISTS ON %s(v2) USING 'sai' " +
+                                       "WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+
+        int sstables = 2;
+        for (int i = 0; i < sstables; i++)
+        {
+            execute("INSERT INTO %s (id1, v2) VALUES (?, ?)", Integer.toString(i), "quick brown fox " + i);
+            flush();
+        }
+
+        StorageAttachedIndex index = (StorageAttachedIndex) getCurrentColumnFamilyStore().indexManager.getIndexByName(indexName);
+        assertEquals(sstables, getCurrentColumnFamilyStore().getLiveSSTables().size());
+        for (SSTableReader sstable : getCurrentColumnFamilyStore().getLiveSSTables())
+        {
+            IndexDescriptor indexDescriptor = IndexDescriptor.create(sstable);
+            assertTrue(indexDescriptor.isPerColumnIndexBuildComplete(index.identifier()));
+            assertTrue(indexDescriptor.hasComponent(IndexComponent.POSITIONS, index.identifier()));
+            assertTrue(indexDescriptor.validatePerIndexComponents(index.termType(), index.identifier(), IndexValidation.CHECKSUM, true, true));
+        }
+        verifySSTableIndexes(index.identifier(), sstables);
     }
 }

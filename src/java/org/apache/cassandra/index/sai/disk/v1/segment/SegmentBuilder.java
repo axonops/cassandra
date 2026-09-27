@@ -80,21 +80,31 @@ public abstract class SegmentBuilder
         {
             super(index, limiter);
 
-            segmentTrieBuffer = new SegmentTrieBuffer();
+            segmentTrieBuffer = new SegmentTrieBuffer(index.hasLuceneAnalyzer());
             totalBytesAllocated = segmentTrieBuffer.memoryUsed();
         }
 
         @Override
-        protected long addInternal(ByteBuffer term, int segmentRowId)
+        protected long addInternal(ByteBuffer term, int segmentRowId, int[] positions)
         {
-            return segmentTrieBuffer.add(v -> index.termType().asComparableBytes(term, v), term.limit(), segmentRowId);
+            return segmentTrieBuffer.add(v -> index.termType().asComparableBytes(term, v), term.limit(), segmentRowId, positions);
+        }
+
+        @Override
+        public long recordDocLength(long sstableRowId, int tokenCount)
+        {
+            long bytesAllocated = segmentTrieBuffer.recordDocLength(castToSegmentRowId(sstableRowId, super.segmentRowIdOffset), tokenCount);
+            totalBytesAllocated += bytesAllocated;
+            return bytesAllocated;
         }
 
         @Override
         protected SegmentMetadata.ComponentMetadataMap flushInternal(IndexDescriptor indexDescriptor) throws IOException
         {
-            SegmentWriter writer = index.termType().isLiteral() ? new LiteralIndexWriter(indexDescriptor, index.identifier())
-                                                                : new NumericIndexWriter(indexDescriptor, index.identifier(), index.termType().fixedSizeOf());
+            SegmentWriter writer = index.hasLuceneAnalyzer()
+                                   ? new LiteralIndexWriter(indexDescriptor, index.identifier(), segmentTrieBuffer.docLengths(maxSegmentRowId + 1))
+                                   : index.termType().isLiteral() ? new LiteralIndexWriter(indexDescriptor, index.identifier())
+                                                                  : new NumericIndexWriter(indexDescriptor, index.identifier(), index.termType().fixedSizeOf());
 
             return writer.writeCompleteSegment(segmentTrieBuffer.iterator());
         }
@@ -123,7 +133,7 @@ public abstract class SegmentBuilder
         }
 
         @Override
-        protected long addInternal(ByteBuffer term, int segmentRowId)
+        protected long addInternal(ByteBuffer term, int segmentRowId, int[] positions)
         {
             return graphIndex.add(term, segmentRowId, OnHeapGraph.InvalidVectorBehavior.IGNORE);
         }
@@ -167,6 +177,11 @@ public abstract class SegmentBuilder
 
     public long add(ByteBuffer term, PrimaryKey key, long sstableRowId)
     {
+        return add(term, key, sstableRowId, null);
+    }
+
+    public long add(ByteBuffer term, PrimaryKey key, long sstableRowId, int[] positions)
+    {
         assert !flushed : "Cannot add to a flushed segment.";
         assert sstableRowId >= maxSSTableRowId;
         minSSTableRowId = minSSTableRowId < 0 ? sstableRowId : minSSTableRowId;
@@ -192,10 +207,21 @@ public abstract class SegmentBuilder
         int segmentRowId = castToSegmentRowId(sstableRowId, segmentRowIdOffset);
         maxSegmentRowId = Math.max(maxSegmentRowId, segmentRowId);
 
-        long bytesAllocated = addInternal(term, segmentRowId);
+        long bytesAllocated = addInternal(term, segmentRowId, positions);
         totalBytesAllocated += bytesAllocated;
 
         return bytesAllocated;
+    }
+
+    /**
+     * Records one row's total token count for the analyzed doc-length array. Only supported by
+     * {@link TrieSegmentBuilder} for indexes with an {@code index_analyzer} option.
+     *
+     * @return the number of heap bytes the call allocated
+     */
+    public long recordDocLength(long sstableRowId, int tokenCount)
+    {
+        throw new UnsupportedOperationException();
     }
 
     public static int castToSegmentRowId(long sstableRowId, long segmentRowIdOffset)
@@ -243,7 +269,7 @@ public abstract class SegmentBuilder
 
     public abstract boolean isEmpty();
 
-    protected abstract long addInternal(ByteBuffer term, int segmentRowId);
+    protected abstract long addInternal(ByteBuffer term, int segmentRowId, int[] positions);
 
     protected abstract SegmentMetadata.ComponentMetadataMap flushInternal(IndexDescriptor indexDescriptor) throws IOException;
 

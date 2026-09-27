@@ -21,7 +21,9 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import javax.annotation.concurrent.NotThreadSafe;
@@ -30,9 +32,12 @@ import com.google.common.base.Stopwatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.carrotsearch.hppc.IntArrayList;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
+import org.apache.cassandra.index.sai.analyzer.AnalyzedToken;
+import org.apache.cassandra.index.sai.analyzer.LuceneTextAnalyzer;
 import org.apache.cassandra.index.sai.disk.PerColumnIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexComponent;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
@@ -80,7 +85,11 @@ public class SSTableIndexWriter implements PerColumnIndexWriter
         if (maybeAbort())
             return;
 
-        if (index.termType().isNonFrozenCollection())
+        if (index.hasLuceneAnalyzer())
+        {
+            addAnalyzedRow(key, row, sstableRowId);
+        }
+        else if (index.termType().isNonFrozenCollection())
         {
             Iterator<ByteBuffer> valueIterator = index.termType().valuesOf(row, nowInSec);
             if (valueIterator != null)
@@ -200,6 +209,83 @@ public class SSTableIndexWriter implements PerColumnIndexWriter
 
         abort(new RuntimeException(String.format("index %s is dropped", index.identifier())));
         return true;
+    }
+
+    /**
+     * The analyzed twin of the value loop in {@link #addRow}: whole row per call, so collection
+     * elements get disjoint position spaces separated by {@link LuceneTextAnalyzer#POSITION_GAP},
+     * the row's doc length is complete, and segments cut only at row boundaries so one document's
+     * postings, positions and doc length never split across segments.
+     */
+    private void addAnalyzedRow(PrimaryKey key, Row row, long sstableRowId) throws IOException
+    {
+        if (currentBuilder == null)
+        {
+            currentBuilder = newSegmentBuilder();
+        }
+        else if (shouldFlush(sstableRowId))
+        {
+            flushSegment();
+            currentBuilder = newSegmentBuilder();
+        }
+
+        Map<ByteBuffer, IntArrayList> termPositions = new LinkedHashMap<>();
+        int positionBase = 0;
+        int rowDocLength = 0;
+
+        if (index.termType().isNonFrozenCollection())
+        {
+            Iterator<ByteBuffer> valueIterator = index.termType().valuesOf(row, nowInSec);
+            int element = 0;
+            while (valueIterator != null && valueIterator.hasNext())
+            {
+                ByteBuffer value = valueIterator.next();
+                if (!index.analyzedTermLimits().validateElementOrdinal(element++, () -> key.partitionKey().toString(), false))
+                    continue;
+
+                positionBase = analyzeValue(key, value, positionBase, termPositions);
+            }
+        }
+        else
+        {
+            ByteBuffer value = index.termType().valueOf(key.partitionKey(), row, nowInSec);
+            if (value != null)
+                analyzeValue(key, value, positionBase, termPositions);
+        }
+
+        if (termPositions.isEmpty())
+            return;
+
+        for (Map.Entry<ByteBuffer, IntArrayList> entry : termPositions.entrySet())
+        {
+            rowDocLength += entry.getValue().size();
+            limiter.increment(currentBuilder.add(entry.getKey(), key, sstableRowId, entry.getValue().toArray()));
+        }
+        limiter.increment(currentBuilder.recordDocLength(sstableRowId, rowDocLength));
+    }
+
+    /**
+     * Analyzes one value and folds its tokens into the row's term to positions map, or nothing at
+     * all when the value breaches the analyzed term limits.
+     *
+     * @return the position base for the row's next value
+     */
+    private int analyzeValue(PrimaryKey key, ByteBuffer value, int positionBase, Map<ByteBuffer, IntArrayList> termPositions)
+    {
+        List<AnalyzedToken> tokens = index.luceneIndexAnalyzer().analyze(value.duplicate());
+        if (tokens.isEmpty() || !index.analyzedTermLimits().validate(tokens, () -> key.partitionKey().toString(), false, null))
+        {
+            // The value indexes nothing, but its element still occupies a distinct position space
+            return positionBase + LuceneTextAnalyzer.POSITION_GAP;
+        }
+
+        int lastPosition = 0;
+        for (AnalyzedToken token : tokens)
+        {
+            termPositions.computeIfAbsent(token.bytes(), t -> new IntArrayList()).add(positionBase + token.position());
+            lastPosition = token.position();
+        }
+        return positionBase + lastPosition + 1 + LuceneTextAnalyzer.POSITION_GAP;
     }
 
     private void addTerm(ByteBuffer term, PrimaryKey key, long sstableRowId) throws IOException
