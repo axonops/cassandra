@@ -93,6 +93,8 @@ public class GuardrailsOptions implements GuardrailsConfig
                                  config.sai_sstable_indexes_per_query_fail_threshold,
                                  "sai_sstable_indexes_per_query",
                                  false);
+        validateSizeThreshold(config.sai_analyzed_size_warn_threshold, config.sai_analyzed_size_fail_threshold, false, "sai_analyzed_size");
+        validateMaxLongThreshold(config.sai_analyzed_tokens_warn_threshold, config.sai_analyzed_tokens_fail_threshold, "sai_analyzed_tokens", false);
     }
 
     @Override
@@ -1042,6 +1044,60 @@ public class GuardrailsOptions implements GuardrailsConfig
                                   fail,
                                   () -> config.sai_vector_term_size_fail_threshold,
                                   x -> config.sai_vector_term_size_fail_threshold = x);
+    }
+
+    @Override
+    @Nullable
+    public DataStorageSpec.LongBytesBound getSaiAnalyzedSizeWarnThreshold()
+    {
+        return config.sai_analyzed_size_warn_threshold;
+    }
+
+    @Override
+    @Nullable
+    public DataStorageSpec.LongBytesBound getSaiAnalyzedSizeFailThreshold()
+    {
+        return config.sai_analyzed_size_fail_threshold;
+    }
+
+    @Override
+    public void setSaiAnalyzedSizeThreshold(@Nullable DataStorageSpec.LongBytesBound warn, @Nullable DataStorageSpec.LongBytesBound fail)
+    {
+        validateSizeThreshold(warn, fail, false, "sai_analyzed_size");
+        updatePropertyWithLogging("sai_analyzed_size_warn_threshold",
+                                  warn,
+                                  () -> config.sai_analyzed_size_warn_threshold,
+                                  x -> config.sai_analyzed_size_warn_threshold = x);
+        updatePropertyWithLogging("sai_analyzed_size_fail_threshold",
+                                  fail,
+                                  () -> config.sai_analyzed_size_fail_threshold,
+                                  x -> config.sai_analyzed_size_fail_threshold = x);
+    }
+
+    @Override
+    public long getSaiAnalyzedTokensWarnThreshold()
+    {
+        return config.sai_analyzed_tokens_warn_threshold;
+    }
+
+    @Override
+    public long getSaiAnalyzedTokensFailThreshold()
+    {
+        return config.sai_analyzed_tokens_fail_threshold;
+    }
+
+    @Override
+    public void setSaiAnalyzedTokensThreshold(long warn, long fail)
+    {
+        validateMaxLongThreshold(warn, fail, "sai_analyzed_tokens", false);
+        updatePropertyWithLogging("sai_analyzed_tokens_warn_threshold",
+                                  warn,
+                                  () -> config.sai_analyzed_tokens_warn_threshold,
+                                  x -> config.sai_analyzed_tokens_warn_threshold = x);
+        updatePropertyWithLogging("sai_analyzed_tokens_fail_threshold",
+                                  fail,
+                                  () -> config.sai_analyzed_tokens_fail_threshold,
+                                  x -> config.sai_analyzed_tokens_fail_threshold = x);
     }
 
     @Override

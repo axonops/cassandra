@@ -550,6 +550,30 @@ public final class Guardrails implements GuardrailsMBean
                      format("Value of column '%s' has size %s, this exceeds the %s threshold of %s.",
                             what, value, isWarning ? "warning" : "failure", threshold));
 
+    /**
+     * Guardrail on the cumulative analyzed size of a value written to an SAI index.
+     */
+    public static final MaxThreshold saiAnalyzedSize =
+    new MaxThreshold("sai_analyzed_size",
+                     null,
+                     state -> sizeToBytes(CONFIG_PROVIDER.getOrCreate(state).getSaiAnalyzedSizeWarnThreshold()),
+                     state -> sizeToBytes(CONFIG_PROVIDER.getOrCreate(state).getSaiAnalyzedSizeFailThreshold()),
+                     (isWarning, what, value, threshold) ->
+                     format("Analyzed size of value in column '%s' is %s, this exceeds the %s threshold of %s.",
+                            what, value, isWarning ? "warning" : "failure", threshold));
+
+    /**
+     * Guardrail on the number of analyzed tokens produced by a value written to an SAI index.
+     */
+    public static final MaxThreshold saiAnalyzedTokens =
+    new MaxThreshold("sai_analyzed_tokens",
+                     null,
+                     state -> CONFIG_PROVIDER.getOrCreate(state).getSaiAnalyzedTokensWarnThreshold(),
+                     state -> CONFIG_PROVIDER.getOrCreate(state).getSaiAnalyzedTokensFailThreshold(),
+                     (isWarning, what, value, threshold) ->
+                     format("Analyzed token count of value in column '%s' is %s, this exceeds the %s threshold of %s.",
+                            what, value, isWarning ? "warning" : "failure", threshold));
+
     public static final EnableFlag nonPartitionRestrictedIndexQueryEnabled =
     new EnableFlag("non_partition_restricted_index_query_enabled",
                    "Executing a query on secondary indexes without partition key restriction might degrade performance",
@@ -1367,6 +1391,44 @@ public final class Guardrails implements GuardrailsMBean
     public void setSaiVectorTermSizeThreshold(@Nullable String warnSize, @Nullable String failSize)
     {
         DEFAULT_CONFIG.setSaiVectorTermSizeThreshold(sizeFromString(warnSize), sizeFromString(failSize));
+    }
+
+    @Override
+    @Nullable
+    public String getSaiAnalyzedSizeWarnThreshold()
+    {
+        return sizeToString(DEFAULT_CONFIG.getSaiAnalyzedSizeWarnThreshold());
+    }
+
+    @Override
+    @Nullable
+    public String getSaiAnalyzedSizeFailThreshold()
+    {
+        return sizeToString(DEFAULT_CONFIG.getSaiAnalyzedSizeFailThreshold());
+    }
+
+    @Override
+    public void setSaiAnalyzedSizeThreshold(@Nullable String warnSize, @Nullable String failSize)
+    {
+        DEFAULT_CONFIG.setSaiAnalyzedSizeThreshold(sizeFromString(warnSize), sizeFromString(failSize));
+    }
+
+    @Override
+    public long getSaiAnalyzedTokensWarnThreshold()
+    {
+        return DEFAULT_CONFIG.getSaiAnalyzedTokensWarnThreshold();
+    }
+
+    @Override
+    public long getSaiAnalyzedTokensFailThreshold()
+    {
+        return DEFAULT_CONFIG.getSaiAnalyzedTokensFailThreshold();
+    }
+
+    @Override
+    public void setSaiAnalyzedTokensThreshold(long warn, long fail)
+    {
+        DEFAULT_CONFIG.setSaiAnalyzedTokensThreshold(warn, fail);
     }
 
     @Override

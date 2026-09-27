@@ -531,6 +531,42 @@ public interface GuardrailsConfig
     void setSaiVectorTermSizeThreshold(@Nullable DataStorageSpec.LongBytesBound warn, @Nullable DataStorageSpec.LongBytesBound fail);
 
     /**
+     * @return the warning threshold for the cumulative analyzed size of a value written to an SAI index
+     */
+    DataStorageSpec.LongBytesBound getSaiAnalyzedSizeWarnThreshold();
+
+    /**
+     * @return the failure threshold for the cumulative analyzed size of a value written to an SAI index
+     */
+    DataStorageSpec.LongBytesBound getSaiAnalyzedSizeFailThreshold();
+
+    /**
+     * Sets warning and failure thresholds for the cumulative analyzed size of a value written to an SAI index
+     *
+     * @param warn value to set for warn threshold
+     * @param fail value to set for fail threshold
+     */
+    void setSaiAnalyzedSizeThreshold(@Nullable DataStorageSpec.LongBytesBound warn, @Nullable DataStorageSpec.LongBytesBound fail);
+
+    /**
+     * @return the warning threshold for the number of analyzed tokens produced by a value written to an SAI index
+     */
+    long getSaiAnalyzedTokensWarnThreshold();
+
+    /**
+     * @return the failure threshold for the number of analyzed tokens produced by a value written to an SAI index
+     */
+    long getSaiAnalyzedTokensFailThreshold();
+
+    /**
+     * Sets warning and failure thresholds for the number of analyzed tokens produced by a value written to an SAI index
+     *
+     * @param warn value to set for warn threshold
+     * @param fail value to set for fail threshold
+     */
+    void setSaiAnalyzedTokensThreshold(long warn, long fail);
+
+    /**
      * Returns whether it is possible to execute a query against secondary indexes without specifying
      * any partition key restrictions.
      *

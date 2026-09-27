@@ -31,6 +31,7 @@ import org.apache.cassandra.auth.AuthenticatedUser;
 import org.apache.cassandra.auth.IAuthenticator;
 import org.apache.cassandra.auth.PasswordAuthenticator;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.SAITester;
@@ -85,7 +86,7 @@ public class AnalyzedTermLimitsTest
     public void clientMutationFailThresholdThrows()
     {
         // the default sai_string_term_size fail threshold is 8KiB
-        AnalyzedTermLimits limits = defaultLimits();
+        AnalyzedTermLimits limits = limits();
         List<AnalyzedToken> tokens = tokens(9 * 1024);
 
         assertThatThrownBy(() -> limits.validate(tokens, () -> "key", true, clientState))
@@ -96,7 +97,7 @@ public class AnalyzedTermLimitsTest
     public void clientMutationWarnThresholdWarns()
     {
         // the default sai_string_term_size warn threshold is 1KiB
-        AnalyzedTermLimits limits = defaultLimits();
+        AnalyzedTermLimits limits = limits();
         List<AnalyzedToken> tokens = tokens(2 * 1024);
 
         ClientWarn.instance.captureWarnings();
@@ -116,7 +117,7 @@ public class AnalyzedTermLimitsTest
     @Test
     public void nonClientBreachDropsWholeValueAndCounts()
     {
-        AnalyzedTermLimits limits = defaultLimits();
+        AnalyzedTermLimits limits = limits();
         List<AnalyzedToken> tokens = tokens(9 * 1024, 10);
 
         assertFalse(limits.validate(tokens, () -> "key", false, null));
@@ -126,7 +127,7 @@ public class AnalyzedTermLimitsTest
     @Test
     public void oversizeTokenCountsAndDropsValue()
     {
-        AnalyzedTermLimits limits = defaultLimits();
+        AnalyzedTermLimits limits = limits();
         List<AnalyzedToken> tokens = tokens(9 * 1024, 9 * 1024, 10);
 
         assertFalse(limits.validate(tokens, () -> "key", false, null));
@@ -137,22 +138,32 @@ public class AnalyzedTermLimitsTest
     @Test
     public void cumulativeSizeThresholdApplies()
     {
-        AnalyzedTermLimits limits = limits(10, 20, AnalyzedTermLimits.DISABLED, AnalyzedTermLimits.DISABLED);
+        AnalyzedTermLimits limits = limits();
         List<AnalyzedToken> tokens = tokens(10, 10, 10);
 
-        assertFalse(limits.validate(tokens, () -> "key", false, null));
-        assertEquals(1, limits.droppedValueCount());
-        assertEquals(0, limits.oversizeTokenCount());
+        String previousWarn = Guardrails.instance.getSaiAnalyzedSizeWarnThreshold();
+        String previousFail = Guardrails.instance.getSaiAnalyzedSizeFailThreshold();
+        Guardrails.instance.setSaiAnalyzedSizeThreshold("10B", "20B");
+        try
+        {
+            assertFalse(limits.validate(tokens, () -> "key", false, null));
+            assertEquals(1, limits.droppedValueCount());
+            assertEquals(0, limits.oversizeTokenCount());
 
-        assertThatThrownBy(() -> limits.validate(tokens, () -> "key", true, clientState))
-        .isInstanceOf(InvalidRequestException.class)
-        .hasMessageContaining("Analyzed size");
+            assertThatThrownBy(() -> limits.validate(tokens, () -> "key", true, clientState))
+            .isInstanceOf(InvalidRequestException.class)
+            .hasMessageContaining("Analyzed size");
+        }
+        finally
+        {
+            Guardrails.instance.setSaiAnalyzedSizeThreshold(previousWarn, previousFail);
+        }
     }
 
     @Test
     public void tokenCountThresholdDisabledByDefault()
     {
-        AnalyzedTermLimits limits = defaultLimits();
+        AnalyzedTermLimits limits = limits();
         List<AnalyzedToken> tokens = tokens(new int[1000]);
 
         assertTrue(limits.validate(tokens, () -> "key", false, null));
@@ -163,23 +174,31 @@ public class AnalyzedTermLimitsTest
     @Test
     public void tokenCountThresholdApplies()
     {
-        AnalyzedTermLimits limits = limits(AnalyzedTermLimits.DEFAULT_ANALYZED_SIZE_WARN_BYTES,
-                                           AnalyzedTermLimits.DEFAULT_ANALYZED_SIZE_FAIL_BYTES,
-                                           3, 5);
+        AnalyzedTermLimits limits = limits();
         List<AnalyzedToken> tokens = tokens(1, 1, 1, 1, 1, 1);
 
-        assertFalse(limits.validate(tokens, () -> "key", false, null));
-        assertEquals(1, limits.droppedValueCount());
+        long previousWarn = Guardrails.instance.getSaiAnalyzedTokensWarnThreshold();
+        long previousFail = Guardrails.instance.getSaiAnalyzedTokensFailThreshold();
+        Guardrails.instance.setSaiAnalyzedTokensThreshold(3, 5);
+        try
+        {
+            assertFalse(limits.validate(tokens, () -> "key", false, null));
+            assertEquals(1, limits.droppedValueCount());
 
-        assertThatThrownBy(() -> limits.validate(tokens, () -> "key", true, clientState))
-        .isInstanceOf(InvalidRequestException.class)
-        .hasMessageContaining("token count");
+            assertThatThrownBy(() -> limits.validate(tokens, () -> "key", true, clientState))
+            .isInstanceOf(InvalidRequestException.class)
+            .hasMessageContaining("token count");
+        }
+        finally
+        {
+            Guardrails.instance.setSaiAnalyzedTokensThreshold(previousWarn, previousFail);
+        }
     }
 
     @Test
     public void sameVerdictRegardlessOfPath()
     {
-        AnalyzedTermLimits limits = defaultLimits();
+        AnalyzedTermLimits limits = limits();
         List<AnalyzedToken> tokens = tokens(9 * 1024);
 
         assertFalse(limits.validate(tokens, () -> "key", false, null));
@@ -187,15 +206,9 @@ public class AnalyzedTermLimitsTest
         assertEquals(2, limits.droppedValueCount());
     }
 
-    private static AnalyzedTermLimits defaultLimits()
+    private static AnalyzedTermLimits limits()
     {
         return new AnalyzedTermLimits(identifier(), SAITester.createIndexTermType(UTF8Type.instance));
-    }
-
-    private static AnalyzedTermLimits limits(long analyzedSizeWarn, long analyzedSizeFail, long tokenCountWarn, long tokenCountFail)
-    {
-        return new AnalyzedTermLimits(identifier(), SAITester.createIndexTermType(UTF8Type.instance),
-                                      analyzedSizeWarn, analyzedSizeFail, tokenCountWarn, tokenCountFail);
     }
 
     private static IndexIdentifier identifier()

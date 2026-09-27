@@ -28,11 +28,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.guardrails.Guardrails;
-import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.utils.IndexIdentifier;
 import org.apache.cassandra.index.sai.utils.IndexTermType;
 import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.NoSpamLogger;
 
@@ -42,17 +40,12 @@ import org.apache.cassandra.utils.NoSpamLogger;
  * either fully indexed or not indexed at all, never a token subset.
  *
  * <p>Three bounds apply. The per token size uses the existing {@code sai_string_term_size}
- * guardrail unchanged. The cumulative analyzed size and the token count per value are constructor
- * parameters pending guardrail integration. The token count bound ships disabled.
+ * guardrail unchanged. The cumulative analyzed size per value uses the {@code sai_analyzed_size}
+ * guardrail and the token count per value uses the {@code sai_analyzed_tokens} guardrail, which
+ * ships disabled.
  */
 public final class AnalyzedTermLimits
 {
-    public static final long DEFAULT_ANALYZED_SIZE_WARN_BYTES = 1024 * 1024;
-    public static final long DEFAULT_ANALYZED_SIZE_FAIL_BYTES = 8 * 1024 * 1024;
-
-    /** Thresholds at or below zero are disabled, matching guardrail semantics */
-    public static final long DISABLED = -1;
-
     public static final String VALUE_DROPPED_MESSAGE = "Value in column '%s' for key '%s' breaches the analyzed " +
                                                        "term limits and the whole value was not indexed. " +
                                                        "(analyzed size: %s, tokens: %s)";
@@ -64,38 +57,20 @@ public final class AnalyzedTermLimits
 
     private final IndexIdentifier indexIdentifier;
     private final IndexTermType indexTermType;
-    private final long analyzedSizeWarnBytes;
-    private final long analyzedSizeFailBytes;
-    private final long tokenCountWarn;
-    private final long tokenCountFail;
     private final LongAdder droppedValues = new LongAdder();
     private final LongAdder oversizeTokens = new LongAdder();
 
     public AnalyzedTermLimits(IndexIdentifier indexIdentifier, IndexTermType indexTermType)
     {
-        this(indexIdentifier, indexTermType,
-             DEFAULT_ANALYZED_SIZE_WARN_BYTES, DEFAULT_ANALYZED_SIZE_FAIL_BYTES,
-             DISABLED, DISABLED);
-    }
-
-    public AnalyzedTermLimits(IndexIdentifier indexIdentifier,
-                              IndexTermType indexTermType,
-                              long analyzedSizeWarnBytes,
-                              long analyzedSizeFailBytes,
-                              long tokenCountWarn,
-                              long tokenCountFail)
-    {
         this.indexIdentifier = indexIdentifier;
         this.indexTermType = indexTermType;
-        this.analyzedSizeWarnBytes = analyzedSizeWarnBytes;
-        this.analyzedSizeFailBytes = analyzedSizeFailBytes;
-        this.tokenCountWarn = tokenCountWarn;
-        this.tokenCountFail = tokenCountFail;
     }
 
     /**
      * Evaluates a value's complete token list against the per token size, cumulative analyzed
-     * size and token count bounds.
+     * size and token count bounds. Client mutations that breach a fail threshold throw
+     * {@link org.apache.cassandra.db.guardrails.GuardrailViolatedException}, and a warn
+     * threshold breach warns the client.
      *
      * @param tokens the value's complete token list
      * @param source lazy description of the value's key for log messages, only read on a breach
@@ -103,8 +78,6 @@ public final class AnalyzedTermLimits
      * @param state the client state, may be null
      * @return true when the value may be indexed, false when a non client path must skip the
      * whole value
-     * @throws InvalidRequestException for client mutations that breach a fail threshold, and
-     * warns the client on a warn threshold breach
      */
     public boolean validate(List<AnalyzedToken> tokens,
                             Supplier<String> source,
@@ -120,8 +93,8 @@ public final class AnalyzedTermLimits
             for (AnalyzedToken token : tokens)
                 Guardrails.saiStringTermSize.guard(token.size(), indexTermType.columnName(), false, state);
 
-            guardSeamThreshold(analyzedSize, analyzedSizeWarnBytes, analyzedSizeFailBytes, this::analyzedSizeMessage, state);
-            guardSeamThreshold(tokens.size(), tokenCountWarn, tokenCountFail, this::tokenCountMessage, state);
+            Guardrails.saiAnalyzedSize.guard(analyzedSize, indexTermType.columnName(), false, state);
+            Guardrails.saiAnalyzedTokens.guard(tokens.size(), indexTermType.columnName(), false, state);
             return true;
         }
 
@@ -135,8 +108,8 @@ public final class AnalyzedTermLimits
             }
         }
 
-        dropped |= breaches(analyzedSize, analyzedSizeFailBytes);
-        dropped |= breaches(tokens.size(), tokenCountFail);
+        dropped |= Guardrails.saiAnalyzedSize.failsOn(analyzedSize, state);
+        dropped |= Guardrails.saiAnalyzedTokens.failsOn(tokens.size(), state);
 
         if (dropped)
         {
@@ -189,56 +162,5 @@ public final class AnalyzedTermLimits
     static void countAnalyzerConfigError()
     {
         analyzerConfigErrors.increment();
-    }
-
-    private static boolean breaches(long value, long threshold)
-    {
-        return threshold > 0 && value > threshold;
-    }
-
-    /**
-     * Mirrors {@link org.apache.cassandra.db.guardrails.Threshold#guard} for the two thresholds
-     * that are not guardrails yet: a fail breach throws only for a query with a client state, a
-     * warn breach warns the client.
-     */
-    private void guardSeamThreshold(long value,
-                                    long warnThreshold,
-                                    long failThreshold,
-                                    SeamMessageProvider messageProvider,
-                                    @Nullable ClientState state)
-    {
-        if (breaches(value, failThreshold))
-        {
-            String message = messageProvider.create(false, value, failThreshold);
-            noSpamLogger.error(indexIdentifier.logMessage(message));
-            if (state != null)
-                throw new InvalidRequestException(message);
-            return;
-        }
-        if (breaches(value, warnThreshold))
-            ClientWarn.instance.warn(messageProvider.create(true, value, warnThreshold));
-    }
-
-    private interface SeamMessageProvider
-    {
-        String create(boolean isWarning, long value, long threshold);
-    }
-
-    private String analyzedSizeMessage(boolean isWarning, long value, long threshold)
-    {
-        return String.format("Analyzed size of value in column '%s' is %s, this exceeds the %s threshold of %s.",
-                             indexTermType.columnName(),
-                             FBUtilities.prettyPrintMemory(value),
-                             isWarning ? "warning" : "failure",
-                             FBUtilities.prettyPrintMemory(threshold));
-    }
-
-    private String tokenCountMessage(boolean isWarning, long value, long threshold)
-    {
-        return String.format("Analyzed token count of value in column '%s' is %s, this exceeds the %s threshold of %s.",
-                             indexTermType.columnName(),
-                             value,
-                             isWarning ? "warning" : "failure",
-                             threshold);
     }
 }
