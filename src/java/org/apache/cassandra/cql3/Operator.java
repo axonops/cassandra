@@ -276,7 +276,7 @@ public enum Operator
             return true;
         }
     },
-    ANALYZER_MATCHES(16)
+    ANALYZER_MATCHES(200)
     {
         @Override
         public String toString()
@@ -292,7 +292,7 @@ public enum Operator
             throw new UnsupportedOperationException();
         }
     },
-    PHRASE(17)
+    PHRASE(201)
     {
         @Override
         public String toString()
@@ -308,6 +308,12 @@ public enum Operator
             throw new UnsupportedOperationException();
         }
     };
+
+    /**
+     * The lowest code an operator added by this fork may use. Fork codes stay clear of the codes
+     * Apache Cassandra uses, so a stock node rejects them instead of reading a stock operator.
+     */
+    public static final int FORK_OPERATOR_BASE = 200;
 
     /**
      * The binary representation of this <code>Enum</code> value.
@@ -416,5 +422,15 @@ public enum Operator
     public boolean isAnalyzed()
     {
         return this == ANALYZER_MATCHES || this == PHRASE;
+    }
+
+    /**
+     * Checks if this operator was added by this fork, which is when its code is at least
+     * {@link #FORK_OPERATOR_BASE}.
+     * @return {@code true} if this operator is a fork operator, {@code false} otherwise.
+     */
+    public boolean isForkOperator()
+    {
+        return b >= FORK_OPERATOR_BASE;
     }
 }
