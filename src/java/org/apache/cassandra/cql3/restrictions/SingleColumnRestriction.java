@@ -159,12 +159,12 @@ public abstract class SingleColumnRestriction implements SingleRestriction
     {
         public static final String EQ_UNSUPPORTED_ON_ANALYZED_MESSAGE =
             "Column '%s' has an analyzed index and its equals_behaviour_when_analyzed is UNSUPPORTED, " +
-            "so = cannot be used on it. Use the : operator, or recreate the index with " +
+            "so = cannot be used on it. Use the MATCH operator, or recreate the index with " +
             "equals_behaviour_when_analyzed MATCH";
 
         public static final String EQ_MATCH_WARNING =
             "Column '%s' has an analyzed index with equals_behaviour_when_analyzed MATCH, so = behaves " +
-            "like the : operator on it";
+            "like the MATCH operator on it";
 
         private final Term value;
 
@@ -853,7 +853,7 @@ public abstract class SingleColumnRestriction implements SingleRestriction
     }
 
     /**
-     * Restriction for the analyzed operators, {@code :} and {@code PHRASE}. Both need a
+     * Restriction for the analyzed operators, {@code MATCH} and {@code PHRASE}. Both need a
      * storage-attached index with an {@code index_analyzer} on the column, and both are gated on
      * every node in the cluster running this build, because a vanilla replica cannot evaluate them.
      */

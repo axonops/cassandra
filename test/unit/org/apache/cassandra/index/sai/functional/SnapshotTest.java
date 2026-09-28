@@ -67,7 +67,7 @@ public class SnapshotTest extends SAITester
         waitForAssert(this::verifyNoIndexFiles);
 
         restoreSnapshot(snapshot);
-        assertNumRows(1, "SELECT * FROM %%s WHERE v2 : '0'");
+        assertNumRows(1, "SELECT * FROM %%s WHERE v2 MATCH '0'");
 
         // the version ab components, positions included, travel with the snapshot
         StorageAttachedIndex index = (StorageAttachedIndex) getCurrentColumnFamilyStore().indexManager.getIndexByName(indexName);

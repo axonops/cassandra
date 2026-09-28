@@ -95,9 +95,9 @@ public class AnalyzedSearchDistributedTest extends TestBaseImpl
                 CLUSTER.forEach(instance -> instance.flush(KEYSPACE));
         }
 
-        assertEquals(10, quorumCount("SELECT pk FROM %s.docs WHERE body : 'quick fox'"));
-        assertEquals(10, quorumCount("SELECT pk FROM %s.docs WHERE body : 'dog'"));
-        assertEquals(0, quorumCount("SELECT pk FROM %s.docs WHERE body : 'quick dog'"));
+        assertEquals(10, quorumCount("SELECT pk FROM %s.docs WHERE body MATCH 'quick fox'"));
+        assertEquals(10, quorumCount("SELECT pk FROM %s.docs WHERE body MATCH 'dog'"));
+        assertEquals(0, quorumCount("SELECT pk FROM %s.docs WHERE body MATCH 'quick dog'"));
         assertEquals(10, quorumCount("SELECT pk FROM %s.docs WHERE body PHRASE 'quick brown fox'"));
         assertEquals(0, quorumCount("SELECT pk FROM %s.docs WHERE body PHRASE 'brown quick'"));
         // the english analyzer drops the stopword but preserves its gap, so 'lazy dog' is adjacent
@@ -123,11 +123,11 @@ public class AnalyzedSearchDistributedTest extends TestBaseImpl
                                                      pk, "lazy dog");
 
         // The stale index match must be dropped by the coordinator re-analyzing the merged newest value
-        assertEquals(0, quorumCount("SELECT pk FROM %s.diverged WHERE body : 'fox'"));
+        assertEquals(0, quorumCount("SELECT pk FROM %s.diverged WHERE body MATCH 'fox'"));
         assertEquals(0, quorumCount("SELECT pk FROM %s.diverged WHERE body PHRASE 'quick brown'"));
 
         // The newest value matches even though only one replica has it indexed
-        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.diverged WHERE body : 'lazy dog'"), ConsistencyLevel.QUORUM),
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.diverged WHERE body MATCH 'lazy dog'"), ConsistencyLevel.QUORUM),
                    row(pk));
         assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.diverged WHERE body PHRASE 'lazy dog'"), ConsistencyLevel.QUORUM),
                    row(pk));
@@ -155,13 +155,13 @@ public class AnalyzedSearchDistributedTest extends TestBaseImpl
 
         // Neither replica matches both predicates locally; the merged row does, and the
         // coordinator's re-analysis must accept it
-        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.partial WHERE a : 'quick' AND b : 'dog'"), ConsistencyLevel.QUORUM),
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.partial WHERE a MATCH 'quick' AND b MATCH 'dog'"), ConsistencyLevel.QUORUM),
                    row(pk));
         assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.partial WHERE a PHRASE 'brown fox' AND b PHRASE 'sleepy dog'"), ConsistencyLevel.QUORUM),
                    row(pk));
 
         // ...and a predicate the merged row does not satisfy stays unmatched
-        assertEquals(0, quorumCount("SELECT pk FROM %s.partial WHERE a : 'quick' AND b : 'cat'"));
+        assertEquals(0, quorumCount("SELECT pk FROM %s.partial WHERE a MATCH 'quick' AND b MATCH 'cat'"));
         assertEquals(0, quorumCount("SELECT pk FROM %s.partial WHERE a PHRASE 'fox brown' AND b PHRASE 'sleepy dog'"));
     }
 

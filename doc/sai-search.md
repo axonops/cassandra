@@ -140,24 +140,28 @@ guardrails above applied per value.
 `query_analyzer` defaults to `index_analyzer` when absent. Analysis options are rejected
 on primary key columns and on non-text columns.
 
-## The `:` match operator
+## The `MATCH` operator
 
-`column : 'value'` matches rows whose analyzed column contains every token the query
+`column MATCH 'value'` matches rows whose analyzed column contains every token the query
 analyzer emits for the value. Multiple tokens are combined with AND semantics:
 
-    SELECT * FROM ks.articles WHERE body : 'quick fox';
+    SELECT * FROM ks.articles WHERE body MATCH 'quick fox';
 
 matches rows whose body contains a token `quick` and a token `fox`, in any order and any
 distance apart. A value the query analyzer emits no tokens for, for example one consisting
 only of stopwords, consistently matches nothing.
 
-On a non-frozen collection of text, `:` matches per element like an analyzed CONTAINS:
+On a non-frozen collection of text, `MATCH` matches per element like an analyzed CONTAINS:
 each token may come from any element. CONTAINS itself also analyzes its value on analyzed
 collection indexes, with the same AND-of-tokens semantics.
 
-`:` requires a storage-attached index with an `index_analyzer` on the column. It is not
-allowed in UPDATE or DELETE WHERE clauses or in LWT IF conditions; conditions always
-compare raw column values.
+`MATCH` requires a storage-attached index with an `index_analyzer` on the column. It is
+not allowed in UPDATE or DELETE WHERE clauses. LWT IF conditions never take `MATCH` or
+`PHRASE`: such a condition is a syntax error, and conditions always compare raw column
+values.
+
+`MATCH` is an unreserved keyword, so `match` can be used as a column, table or user name.
+There is no `:` operator. `column : 'value'` is a syntax error, write it as `column MATCH 'value'`.
 
 ## The `PHRASE` operator
 
@@ -186,8 +190,8 @@ an `index_analyzer`:
 
 | Option value | Behaviour of `=` on the analyzed column |
 |---|---|
-| `UNSUPPORTED` (default) | The query is rejected with an error suggesting the `:` operator |
-| `MATCH` | `=` behaves exactly like `:`, and the client receives a warning |
+| `UNSUPPORTED` (default) | The query is rejected with an error suggesting the `MATCH` operator |
+| `MATCH` | `=` behaves exactly like the `MATCH` operator, and the client receives a warning |
 
 LWT IF conditions are unaffected: they always compare raw bytes, so under `MATCH` a
 SELECT with `=` and an IF condition with `=` can disagree by design.
@@ -197,12 +201,12 @@ SELECT with `=` and an IF condition with `=` can disagree by design.
 WHERE clauses accept `OR` between predicates, with `AND` binding tighter and parentheses
 overriding precedence:
 
-    SELECT * FROM ks.articles WHERE category = 'news' OR (score > 100 AND body : 'fox');
+    SELECT * FROM ks.articles WHERE category = 'news' OR (score > 100 AND body MATCH 'fox');
 
 Semantics are those of strict boolean evaluation over the reconciled row: a row is
 returned when the merged, newest version of its data satisfies the expression. Rows
-matching several disjuncts are returned once. Analyzed `:` and `PHRASE` predicates keep
-their own semantics inside a disjunction, so the tokens of one `:` value stay AND
+matching several disjuncts are returned once. Analyzed `MATCH` and `PHRASE` predicates keep
+their own semantics inside a disjunction, so the tokens of one `MATCH` value stay AND
 combined within that predicate.
 
 Restrictions in this cut, each refused with a clear error:
@@ -232,7 +236,7 @@ without regular column restrictions, exactly as for conjunctions.
 
 ## Cluster upgrade rule
 
-The `:` and `PHRASE` operators, `=` under `MATCH` behaviour, and `OR` in WHERE clauses
+The `MATCH` and `PHRASE` operators, `=` under `MATCH` behaviour, and `OR` in WHERE clauses
 are refused with an InvalidRequest error until every node in the cluster runs this build.
 Nodes advertise a fork messaging version and the coordinator checks that all live peers
 speak it before accepting one of these queries. During a rolling upgrade the queries fail

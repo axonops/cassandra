@@ -227,6 +227,7 @@ K_SELECT_MASKED: S E L E C T '_' M A S K E D;
 K_VECTOR:      V E C T O R;
 K_ANN:         A N N;
 K_PHRASE:      P H R A S E;
+K_MATCH:       M A T C H;
 
 // Case-insensitive alpha characters
 fragment A: ('a'|'A');

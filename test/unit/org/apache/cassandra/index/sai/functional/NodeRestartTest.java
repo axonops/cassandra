@@ -50,7 +50,7 @@ public class NodeRestartTest extends SAITester
         simulateNodeRestart();
 
         verifySSTableIndexes(indexIdentifier, 1);
-        assertNumRows(1, "SELECT * FROM %%s WHERE v2 : '0'");
+        assertNumRows(1, "SELECT * FROM %%s WHERE v2 MATCH '0'");
     }
 
     // Failure during the pre-join and initialization tasks shouldn't fail node restart.

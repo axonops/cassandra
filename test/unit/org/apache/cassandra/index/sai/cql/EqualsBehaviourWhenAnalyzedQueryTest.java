@@ -54,8 +54,8 @@ public class EqualsBehaviourWhenAnalyzedQueryTest extends SAITester
         beforeAndAfterFlush(() -> {
             assertInvalidMessage(String.format(SingleColumnRestriction.EQRestriction.EQ_UNSUPPORTED_ON_ANALYZED_MESSAGE, "body"),
                                  "SELECT id FROM %s WHERE body = 'quick fox'");
-            // the : operator is the supported spelling
-            assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body : 'quick fox'"), row(1));
+            // the MATCH operator is the supported spelling
+            assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body MATCH 'quick fox'"), row(1));
         });
     }
 
@@ -80,7 +80,7 @@ public class EqualsBehaviourWhenAnalyzedQueryTest extends SAITester
             List<String> warnings = ClientWarn.instance.getWarnings();
             assertNotNull(warnings);
             assertTrue(warnings.toString(),
-                       warnings.stream().anyMatch(w -> w.contains("= behaves like the : operator")));
+                       warnings.stream().anyMatch(w -> w.contains("= behaves like the MATCH operator")));
             ClientWarn.instance.resetWarnings();
         });
     }
@@ -110,10 +110,8 @@ public class EqualsBehaviourWhenAnalyzedQueryTest extends SAITester
 
         execute("INSERT INTO %s (id, body) VALUES (1, 'quick fox')");
 
-        assertInvalidMessage("The : operator is not supported in conditions",
-                             "UPDATE %s SET body = 'a' WHERE id = 1 IF body : 'quick'");
-        assertInvalidMessage("The : operator is not supported in conditions",
-                             "DELETE FROM %s WHERE id = 1 IF body : 'quick'");
+        assertInvalidSyntax("UPDATE %s SET body = 'a' WHERE id = 1 IF body MATCH 'quick'");
+        assertInvalidSyntax("DELETE FROM %s WHERE id = 1 IF body MATCH 'quick'");
     }
 
     @Test

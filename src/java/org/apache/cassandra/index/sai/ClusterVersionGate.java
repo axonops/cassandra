@@ -31,7 +31,7 @@ import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.FBUtilities;
 
 /**
- * Cluster-wide upgrade gate for the SAI full-text query features. The analyzed operators {@code :}
+ * Cluster-wide upgrade gate for the SAI full-text query features. The analyzed operators {@code MATCH}
  * and {@code PHRASE}, and {@code =} when rewritten by {@code equals_behaviour_when_analyzed}, are
  * refused until every live peer runs a build that advertises
  * {@link MessagingService#VERSION_AXON_50}. A vanilla replica would evaluate the new operators

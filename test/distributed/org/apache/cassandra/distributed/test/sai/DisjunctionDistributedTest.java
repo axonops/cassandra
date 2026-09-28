@@ -169,7 +169,7 @@ public class DisjunctionDistributedTest extends TestBaseImpl
         CLUSTER.get(1).executeInternal(withKeyspace("UPDATE %s.analyzed SET body = 'quick brown fox' WHERE pk = 0"));
         CLUSTER.get(2).executeInternal(withKeyspace("UPDATE %s.analyzed SET v = 7 WHERE pk = 0"));
 
-        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.analyzed WHERE (body : 'quick' AND v = 7) OR w = 5"), ConsistencyLevel.ALL),
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.analyzed WHERE (body MATCH 'quick' AND v = 7) OR w = 5"), ConsistencyLevel.ALL),
                    row(0));
 
         // A stale analyzed match overwritten on another replica must be dropped by the
@@ -177,7 +177,7 @@ public class DisjunctionDistributedTest extends TestBaseImpl
         CLUSTER.get(1).executeInternal(withKeyspace("UPDATE %s.analyzed USING TIMESTAMP 1 SET body = 'quick brown fox', v = 7 WHERE pk = 10"));
         CLUSTER.get(2).executeInternal(withKeyspace("UPDATE %s.analyzed USING TIMESTAMP 2 SET body = 'lazy dog' WHERE pk = 10"));
 
-        assertEquals(0, countAtAll("SELECT pk FROM %s.analyzed WHERE pk = 10 AND ((body : 'quick' AND v = 7) OR w = 5) ALLOW FILTERING"));
+        assertEquals(0, countAtAll("SELECT pk FROM %s.analyzed WHERE pk = 10 AND ((body MATCH 'quick' AND v = 7) OR w = 5) ALLOW FILTERING"));
     }
 
     @Test

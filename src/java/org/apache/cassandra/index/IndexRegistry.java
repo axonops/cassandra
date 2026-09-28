@@ -319,7 +319,7 @@ public interface IndexRegistry
 
     /**
      * Returns the analysis view of the first registered index that analyzes the given column, empty
-     * when no registered index does. Used to evaluate the analyzed operators, {@code :} and
+     * when no registered index does. Used to evaluate the analyzed operators, {@code MATCH} and
      * {@code PHRASE}, in row filters, and to apply the {@code equals_behaviour_when_analyzed}
      * option to {@code =} restrictions.
      *

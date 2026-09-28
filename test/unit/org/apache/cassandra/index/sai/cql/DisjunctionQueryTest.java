@@ -159,12 +159,12 @@ public class DisjunctionQueryTest extends SAITester
 
         beforeAndAfterFlush(() -> {
             // The multi token leaf keeps AND semantics inside its branch of the union
-            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE body : 'quick brown' OR v = 7"),
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE body MATCH 'quick brown' OR v = 7"),
                                     row(1), row(3));
-            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE body : 'quick brown' OR body : 'lazy'"),
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE body MATCH 'quick brown' OR body MATCH 'lazy'"),
                                     row(1), row(2));
             // tokens that only match across branches must not leak into one another
-            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE body : 'lazy fox' OR v = 7"),
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE body MATCH 'lazy fox' OR v = 7"),
                                     row(3));
         });
     }

@@ -281,7 +281,7 @@ public enum Operator
         @Override
         public String toString()
         {
-            return ":";
+            return "MATCH";
         }
 
         @Override
@@ -415,8 +415,8 @@ public enum Operator
     }
 
     /**
-     * Checks if this operator is evaluated through an index analyzer, i.e. the analyzed match
-     * operator {@code :} or the {@code PHRASE} operator.
+     * Checks if this operator is evaluated through an index analyzer, i.e. the {@code MATCH}
+     * operator or the {@code PHRASE} operator.
      * @return {@code true} if this operator needs an index analyzer, {@code false} otherwise.
      */
     public boolean isAnalyzed()

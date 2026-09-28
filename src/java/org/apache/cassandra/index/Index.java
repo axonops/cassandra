@@ -422,7 +422,7 @@ public interface Index
 
     /**
      * An analysis view over an index whose column values are transformed by an analyzer before
-     * indexing. Row filter evaluation of the analyzed operators, {@code :} and {@code PHRASE},
+     * indexing. Row filter evaluation of the analyzed operators, {@code MATCH} and {@code PHRASE},
      * cannot compare raw bytes, so it consults this surface to re-analyze the stored value instead.
      * The coordinator uses this during replica filtering protection re-checks. The analyzer is
      * always re-derived from schema, never serialized.
@@ -430,7 +430,7 @@ public interface Index
     interface Analyzer
     {
         /**
-         * The {@code :} operator semantics: analyzes the query value with the query analyzer and
+         * The {@code MATCH} operator semantics: analyzes the query value with the query analyzer and
          * the stored value with the index analyzer.
          *
          * @return true when every query token appears among the stored value's tokens

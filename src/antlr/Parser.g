@@ -743,7 +743,7 @@ createFunctionStatement returns [CreateFunctionStatement.Raw stmt]
       ')'
       ( (K_RETURNS K_NULL) | (K_CALLED { calledOnNullInput=true; })) K_ON K_NULL K_INPUT
       K_RETURNS returnType = comparatorType
-      K_LANGUAGE (language = IDENT | language = K_PHRASE)
+      K_LANGUAGE (language = IDENT | language = K_PHRASE | language = K_MATCH)
       K_AS body = STRING_LITERAL
       { $stmt = new CreateFunctionStatement.Raw(
           fn, argNames, argTypes, returnType, calledOnNullInput, $language.text.toLowerCase(), $body.text, orReplace, ifNotExists);
@@ -1782,12 +1782,12 @@ relationType returns [Operator op]
     | '>'  { $op = Operator.GT; }
     | '>=' { $op = Operator.GTE; }
     | '!=' { $op = Operator.NEQ; }
-    | ':'  { $op = Operator.ANALYZER_MATCHES; }
     ;
 
 relation[WhereClause.Builder clauses]
     : name=cident type=relationType t=term { $clauses.add(new SingleColumnRelation(name, type, t)); }
     | name=cident K_LIKE t=term { $clauses.add(new SingleColumnRelation(name, Operator.LIKE, t)); }
+    | name=cident K_MATCH t=term { $clauses.add(new SingleColumnRelation(name, Operator.ANALYZER_MATCHES, t)); }
     | name=cident K_PHRASE t=term { $clauses.add(new SingleColumnRelation(name, Operator.PHRASE, t)); }
     | name=cident K_IS K_NOT K_NULL { $clauses.add(new SingleColumnRelation(name, Operator.IS_NOT, Constants.NULL_LITERAL)); }
     | K_TOKEN l=tupleOfIdentifiers type=relationType t=term
@@ -1936,6 +1936,7 @@ vector_type returns [CQL3Type.Raw vt]
 username
     : IDENT
     | K_PHRASE
+    | K_MATCH
     | STRING_LITERAL
     | QUOTED_NAME { addRecognitionError("Quoted strings are are not supported for user names and USER is deprecated, please use ROLE");}
     ;
@@ -1943,6 +1944,7 @@ username
 identity
     : IDENT
     | K_PHRASE
+    | K_MATCH
     | STRING_LITERAL
     | QUOTED_NAME { addRecognitionError("Quoted strings are are not supported for identity");}
     ;
@@ -2039,5 +2041,6 @@ basic_unreserved_keyword returns [String str]
         | K_VECTOR
         | K_ANN
         | K_PHRASE
+        | K_MATCH
         ) { $str = $k.text; }
     ;
