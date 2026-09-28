@@ -1262,9 +1262,16 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
             }
         }
 
+        // A group that cannot execute OR nodes must never see a filter tree, since it would
+        // plan the leaf expressions as an intersection and silently return wrong results
+        boolean containsDisjunction = rowFilter.containsDisjunction();
+
         Set<Index.QueryPlan> queryPlans = new HashSet<>(indexGroups.size());
         for (Index.Group g : indexGroups.values())
         {
+            if (containsDisjunction && !g.supportsDisjunction())
+                continue;
+
             Index.QueryPlan queryPlan = g.queryPlanFor(rowFilter);
 
             if (queryPlan != null)

@@ -179,7 +179,9 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         AbstractRetreiver(ReadExecutionController executionController)
         {
             this.executionController = executionController;
-            this.filterTree = Operation.buildFilter(queryController, queryController.usesStrictFiltering());
+            // Per node strictness applies on the replica, the coordinator re-check is the
+            // only place that forces the whole tree strict
+            this.filterTree = Operation.buildFilter(queryController, false);
         }
 
         @Override

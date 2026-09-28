@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.index.sai.plan;
 
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -73,10 +74,10 @@ public class StorageAttachedIndexQueryPlan implements Index.QueryPlan
         RowFilter preIndexFilter = filter;
         RowFilter postIndexFilter = filter;
 
-        for (RowFilter.Expression expression : filter)
+        for (RowFilter.Expression expression : filter.root().expressions())
         {
             // We ignore any expressions here (currently IN and user-defined expressions) where we don't have a way to
-            // translate their #isSatifiedBy method, they will be included in the filter returned by 
+            // translate their #isSatifiedBy method, they will be included in the filter returned by
             // QueryPlan#postIndexQueryFilter(). If strict filtering is not allowed, we must reject the query until the
             // expression(s) in question are compatible with #isSatifiedBy.
             //
@@ -88,12 +89,12 @@ public class StorageAttachedIndexQueryPlan implements Index.QueryPlan
                 if (!filter.isStrict())
                     throw new InvalidRequestException(String.format(UNSUPPORTED_NON_STRICT_OPERATOR, expression.operator()));
 
-                if (preIndexFilter.getExpressions().contains(expression))
+                if (preIndexFilter.root().expressions().contains(expression))
                     preIndexFilter = preIndexFilter.without(expression);
                 continue;
             }
 
-            if (postIndexFilter.getExpressions().contains(expression))
+            if (postIndexFilter.root().expressions().contains(expression))
                 postIndexFilter = postIndexFilter.without(expression);
 
             for (StorageAttachedIndex index : indexes)
@@ -103,6 +104,32 @@ public class StorageAttachedIndexQueryPlan implements Index.QueryPlan
                     selectedIndexesBuilder.add(index);
                 }
             }
+        }
+
+        if (filter.containsDisjunction())
+        {
+            // A disjunction whose branches are not all index supported cannot use the index: a
+            // branch without an index would contribute nothing to the union and its matches
+            // would silently go missing. Such queries stay on the filtering path.
+            for (RowFilter.FilterElement child : filter.root().children())
+            {
+                for (RowFilter.Expression expression : child.leaves())
+                {
+                    Set<StorageAttachedIndex> supporting = new HashSet<>(1);
+                    for (StorageAttachedIndex index : indexes)
+                        if (index.supportsExpression(expression.column(), expression.operator()))
+                            supporting.add(index);
+
+                    if (supporting.isEmpty())
+                        return null;
+
+                    selectedIndexesBuilder.addAll(supporting);
+                }
+            }
+
+            // The searcher evaluates the whole tree, including its disjunctions, in its own
+            // post filter, so only the root expressions it cannot handle remain here
+            postIndexFilter = postIndexFilter.withoutDisjunctions();
         }
 
         ImmutableSet<Index> selectedIndexes = selectedIndexesBuilder.build();

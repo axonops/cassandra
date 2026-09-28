@@ -71,6 +71,7 @@ import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexRegistry;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.TableMetadata;
@@ -88,33 +89,37 @@ import static org.apache.cassandra.cql3.statements.RequestValidations.checkNotNu
  * {@link ClusteringIndexFilter}. Some of the expressions of this filter may
  * be handled by a 2ndary index, and the rest is simply filtered out from the
  * result set (the later can only happen if the query was using ALLOW FILTERING).
+ * <p>
+ * The filter is a tree of {@link FilterElement} nodes whose root is always a conjunction.
+ * Queries without OR produce a flat root with no children, and iterating the filter visits
+ * the leaf expressions of the whole tree in document order.
  */
 public class RowFilter implements Iterable<RowFilter.Expression>
 {
     private static final Logger logger = LoggerFactory.getLogger(RowFilter.class);
 
     public static final Serializer serializer = new Serializer();
-    private static final RowFilter NONE = new RowFilter(Collections.emptyList(), false);
+    private static final RowFilter NONE = new RowFilter(new FilterElement(false, Collections.emptyList(), Collections.emptyList()), false);
 
-    protected final List<Expression> expressions;
+    private final FilterElement root;
 
     private final boolean needsReconciliation;
 
-    protected RowFilter(List<Expression> expressions, boolean needsReconciliation)
+    protected RowFilter(FilterElement root, boolean needsReconciliation)
     {
-        this.expressions = expressions;
+        this.root = root;
         this.needsReconciliation = needsReconciliation;
     }
 
     /**
-     * 
-     * @param needsReconciliation whether or not this filter belongs to a read that requires coordinator reconciliation 
-     * 
+     *
+     * @param needsReconciliation whether or not this filter belongs to a read that requires coordinator reconciliation
+     *
      * @return a new {@link RowFilter} with an empty {@link Expression} list
      */
     public static RowFilter create(boolean needsReconciliation)
     {
-        return new RowFilter(new ArrayList<>(), needsReconciliation);
+        return new RowFilter(new FilterElement(false, new ArrayList<>(), new ArrayList<>()), needsReconciliation);
     }
 
     public static RowFilter none()
@@ -122,32 +127,40 @@ public class RowFilter implements Iterable<RowFilter.Expression>
         return NONE;
     }
 
+    public FilterElement root()
+    {
+        return root;
+    }
+
     public SimpleExpression add(ColumnMetadata def, Operator op, ByteBuffer value)
     {
-        SimpleExpression expression = new SimpleExpression(def, op, value);
-        add(expression);
-        return expression;
+        return root.add(def, op, value);
     }
 
     public void addMapEquality(ColumnMetadata def, ByteBuffer key, Operator op, ByteBuffer value)
     {
-        add(new MapEqualityExpression(def, key, op, value));
+        root.add(new MapEqualityExpression(def, key, op, value));
     }
 
     public void addCustomIndexExpression(TableMetadata metadata, IndexMetadata targetIndex, ByteBuffer value)
     {
-        add(new CustomExpression(metadata, targetIndex, value));
+        root.add(new CustomExpression(metadata, targetIndex, value));
     }
 
-    private void add(Expression expression)
-    {
-        expression.validate();
-        expressions.add(expression);
-    }
-
+    /**
+     * @return every leaf expression of the tree, in document order
+     */
     public List<Expression> getExpressions()
     {
-        return expressions;
+        return root.children().isEmpty() ? root.expressions() : root.leaves();
+    }
+
+    /**
+     * @return true if any node of the tree is a disjunction
+     */
+    public boolean containsDisjunction()
+    {
+        return root.containsDisjunction();
     }
 
     /**
@@ -162,9 +175,9 @@ public class RowFilter implements Iterable<RowFilter.Expression>
     /**
      * If this filter belongs to a read that requires reconciliation at the coordinator, and it contains an intersection
      * on two or more non-key (and therefore mutable) columns, we cannot strictly apply it to local, unrepaired rows.
-     * When this occurs, we must downgrade the intersection of expressions to a union and leave the coordinator to 
+     * When this occurs, we must downgrade the intersection of expressions to a union and leave the coordinator to
      * filter strictly before sending results to the client.
-     * 
+     *
      * @return true if strict filtering is safe
      *
      * @see <a href="https://issues.apache.org/jira/browse/CASSANDRA-19018">CASSANDRA-19018</a>
@@ -175,27 +188,12 @@ public class RowFilter implements Iterable<RowFilter.Expression>
     }
 
     /**
-     * @return true if this filter contains an intersection on either any static column or two regular mutable columns
+     * @return true if any node of this filter contains an intersection on either any static column or two regular
+     * mutable columns, and therefore needs the CASSANDRA-19018 downgrade somewhere in the tree
      */
     public boolean isMutableIntersection()
     {
-        Set<ColumnMetadata> columns = null;
-        for (Expression e : expressions)
-        {
-            if (e.column.isStatic() && expressions.size() > 1)
-                return true;
-
-            if (!e.column.isPrimaryKeyColumn())
-            {
-                if (columns == null)
-                    columns = new HashSet<>(expressions.size());
-
-                columns.add(e.column);
-                if (columns.size() > 1)
-                    return true;
-            }
-        }
-        return false;
+        return root.hasMutableIntersection();
     }
 
     /**
@@ -204,7 +202,7 @@ public class RowFilter implements Iterable<RowFilter.Expression>
      */
     public boolean hasExpressionOnClusteringOrRegularColumns()
     {
-        for (Expression expression : expressions)
+        for (Expression expression : getExpressions())
         {
             ColumnMetadata column = expression.column();
             if (column.isClusteringColumn() || column.isRegular())
@@ -225,7 +223,7 @@ public class RowFilter implements Iterable<RowFilter.Expression>
     {
         List<Expression> partitionLevelExpressions = new ArrayList<>();
         List<Expression> rowLevelExpressions = new ArrayList<>();
-        for (Expression e: expressions)
+        for (Expression e: root.expressions())
         {
             if (e.column.isStatic() || e.column.isPartitionKey())
                 partitionLevelExpressions.add(e);
@@ -233,21 +231,41 @@ public class RowFilter implements Iterable<RowFilter.Expression>
                 rowLevelExpressions.add(e);
         }
 
-        long numberOfRegularColumnExpressions = rowLevelExpressions.size();
-        final boolean filterNonStaticColumns = numberOfRegularColumnExpressions > 0;
+        // A subtree evaluates at the partition level only when every leaf is on a static or partition key
+        // column, since a static leaf inside a disjunction must not veto the whole partition on its own.
+        List<FilterElement> partitionLevelElements = new ArrayList<>();
+        List<FilterElement> rowLevelElements = new ArrayList<>();
+        for (FilterElement child : root.children())
+        {
+            if (child.restrictsOnlyStaticOrPartitionKeyColumns())
+                partitionLevelElements.add(child);
+            else
+                rowLevelElements.add(child);
+        }
+
+        final boolean filterNonStaticColumns = !rowLevelExpressions.isEmpty() || !rowLevelElements.isEmpty();
 
         return new Transformation<>()
         {
             DecoratedKey pk;
+            Row staticRow;
 
             @Override
             protected BaseRowIterator<?> applyToPartition(BaseRowIterator<?> partition)
             {
                 pk = partition.partitionKey();
+                staticRow = partition.staticRow();
 
                 // Short-circuit all partitions that won't match based on static and partition keys
                 for (Expression e : partitionLevelExpressions)
-                    if (!e.isSatisfiedBy(metadata, partition.partitionKey(), partition.staticRow(), nowInSec))
+                    if (!e.isSatisfiedBy(metadata, pk, staticRow, nowInSec))
+                    {
+                        partition.close();
+                        return null;
+                    }
+
+                for (FilterElement element : partitionLevelElements)
+                    if (!element.isSatisfiedBy(metadata, pk, staticRow, staticRow, nowInSec))
                     {
                         partition.close();
                         return null;
@@ -280,6 +298,10 @@ public class RowFilter implements Iterable<RowFilter.Expression>
                     if (!e.isSatisfiedBy(metadata, pk, purged, nowInSec))
                         return null;
 
+                for (FilterElement element : rowLevelElements)
+                    if (!element.isSatisfiedBy(metadata, pk, purged, staticRow, nowInSec))
+                        return null;
+
                 return row;
             }
         };
@@ -295,7 +317,7 @@ public class RowFilter implements Iterable<RowFilter.Expression>
      */
     public UnfilteredPartitionIterator filter(UnfilteredPartitionIterator iter, long nowInSec)
     {
-        return expressions.isEmpty() ? iter : Transformation.apply(iter, filter(iter.metadata(), nowInSec));
+        return isEmpty() ? iter : Transformation.apply(iter, filter(iter.metadata(), nowInSec));
     }
 
     /**
@@ -308,7 +330,7 @@ public class RowFilter implements Iterable<RowFilter.Expression>
      */
     public PartitionIterator filter(PartitionIterator iter, TableMetadata metadata, long nowInSec)
     {
-        return expressions.isEmpty() ? iter : Transformation.apply(iter, filter(metadata, nowInSec));
+        return isEmpty() ? iter : Transformation.apply(iter, filter(metadata, nowInSec));
     }
 
     /**
@@ -325,14 +347,9 @@ public class RowFilter implements Iterable<RowFilter.Expression>
         // We purge all tombstones as the expressions isSatisfiedBy methods expects it
         Row purged = row.purge(DeletionPurger.PURGE_ALL, nowInSec, metadata.enforceStrictLiveness());
         if (purged == null)
-            return expressions.isEmpty();
+            return isEmpty();
 
-        for (Expression e : expressions)
-        {
-            if (!e.isSatisfiedBy(metadata, partitionKey, purged, nowInSec))
-                return false;
-        }
-        return true;
+        return root.isSatisfiedBy(metadata, partitionKey, purged, purged, nowInSec);
     }
 
     /**
@@ -341,7 +358,7 @@ public class RowFilter implements Iterable<RowFilter.Expression>
      */
     public boolean partitionKeyRestrictionsAreSatisfiedBy(DecoratedKey key, AbstractType<?> keyValidator)
     {
-        for (Expression e : expressions)
+        for (Expression e : getExpressions())
         {
             if (!e.column.isPartitionKey())
                 continue;
@@ -361,7 +378,7 @@ public class RowFilter implements Iterable<RowFilter.Expression>
      */
     public boolean clusteringKeyRestrictionsAreSatisfiedBy(Clustering<?> clustering)
     {
-        for (Expression e : expressions)
+        for (Expression e : getExpressions())
         {
             if (!e.column.isClusteringColumn())
                 continue;
@@ -376,42 +393,45 @@ public class RowFilter implements Iterable<RowFilter.Expression>
 
     /**
      * Returns this filter but without the provided expression. This method
-     * *assumes* that the filter contains the provided expression.
+     * *assumes* that the filter contains the provided expression. Removing a leaf from a
+     * disjunction would change semantics, so the expression must live on the root node.
      */
     public RowFilter without(Expression expression)
     {
-        assert expressions.contains(expression);
-        if (expressions.size() == 1)
+        assert root.expressions().contains(expression);
+        if (root.expressions().size() == 1 && root.children().isEmpty())
             return RowFilter.none();
 
-        List<Expression> newExpressions = new ArrayList<>(expressions.size() - 1);
-        for (Expression e : expressions)
+        List<Expression> newExpressions = new ArrayList<>(Math.max(0, root.expressions().size() - 1));
+        for (Expression e : root.expressions())
             if (!e.equals(expression))
                 newExpressions.add(e);
 
-        return withNewExpressions(newExpressions);
+        return new RowFilter(new FilterElement(false, newExpressions, root.children()), needsReconciliation);
     }
 
     /**
      * Returns a copy of this filter but without the provided expression. If this filter doesn't contain the specified
-     * expression this method will just return an identical copy of this filter.
+     * expression this method will just return an identical copy of this filter. Only root node expressions are
+     * removed, since removing a leaf from a disjunction would change semantics.
      */
     public RowFilter without(ColumnMetadata column, Operator op, ByteBuffer value)
     {
         if (isEmpty())
             return this;
 
-        List<Expression> newExpressions = new ArrayList<>(expressions.size() - 1);
-        for (Expression e : expressions)
+        // The root may hold no expressions of its own when the filter is only a disjunction
+        List<Expression> newExpressions = new ArrayList<>(Math.max(0, root.expressions().size() - 1));
+        for (Expression e : root.expressions())
             if (!e.column().equals(column) || e.operator() != op || !e.value.equals(value))
                 newExpressions.add(e);
 
-        return withNewExpressions(newExpressions);
+        return new RowFilter(new FilterElement(false, newExpressions, root.children()), needsReconciliation);
     }
 
     public boolean hasNonKeyExpression()
     {
-        for (Expression e : expressions)
+        for (Expression e : getExpressions())
             if (!e.column().isPrimaryKeyColumn())
                 return true;
 
@@ -420,7 +440,7 @@ public class RowFilter implements Iterable<RowFilter.Expression>
 
     public boolean hasStaticExpression()
     {
-        for (Expression e : expressions)
+        for (Expression e : getExpressions())
             if (e.column().isStatic())
                 return true;
 
@@ -432,19 +452,30 @@ public class RowFilter implements Iterable<RowFilter.Expression>
         return withNewExpressions(Collections.emptyList());
     }
 
+    /**
+     * Returns a copy of this filter with the root expressions only, dropping every child subtree.
+     */
+    public RowFilter withoutDisjunctions()
+    {
+        if (root.children().isEmpty())
+            return this;
+
+        return new RowFilter(new FilterElement(false, root.expressions(), Collections.emptyList()), needsReconciliation);
+    }
+
     protected RowFilter withNewExpressions(List<Expression> expressions)
     {
-        return new RowFilter(expressions, needsReconciliation);
+        return new RowFilter(new FilterElement(false, expressions, Collections.emptyList()), needsReconciliation);
     }
 
     public boolean isEmpty()
     {
-        return expressions.isEmpty();
+        return root.isEmpty();
     }
 
     public Iterator<Expression> iterator()
     {
-        return expressions.iterator();
+        return getExpressions().iterator();
     }
 
     @Override
@@ -465,14 +496,229 @@ public class RowFilter implements Iterable<RowFilter.Expression>
 
     private String toString(boolean cql)
     {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < expressions.size(); i++)
+        return root.toString(cql);
+    }
+
+    /**
+     * A node of the filter tree. A node is either a conjunction (AND) or a disjunction (OR) over
+     * its local leaf expressions and its child nodes. The root of a {@link RowFilter} is always a
+     * conjunction, so flat filters are a root with no children.
+     */
+    public static class FilterElement
+    {
+        private final boolean isDisjunction;
+        private final List<Expression> expressions;
+        private final List<FilterElement> children;
+
+        public FilterElement(boolean isDisjunction, List<Expression> expressions, List<FilterElement> children)
         {
-            if (i > 0)
-                sb.append(" AND ");
-            sb.append(expressions.get(i).toString(cql));
+            this.isDisjunction = isDisjunction;
+            this.expressions = expressions;
+            this.children = children;
         }
-        return sb.toString();
+
+        public boolean isDisjunction()
+        {
+            return isDisjunction;
+        }
+
+        public List<Expression> expressions()
+        {
+            return expressions;
+        }
+
+        public List<FilterElement> children()
+        {
+            return children;
+        }
+
+        public SimpleExpression add(ColumnMetadata def, Operator op, ByteBuffer value)
+        {
+            SimpleExpression expression = new SimpleExpression(def, op, value);
+            add(expression);
+            return expression;
+        }
+
+        public void add(Expression expression)
+        {
+            expression.validate();
+            expressions.add(expression);
+        }
+
+        public FilterElement addOrChild()
+        {
+            return newChild(true);
+        }
+
+        public FilterElement addAndChild()
+        {
+            return newChild(false);
+        }
+
+        public void addChild(FilterElement child)
+        {
+            children.add(child);
+        }
+
+        private FilterElement newChild(boolean childIsDisjunction)
+        {
+            FilterElement child = new FilterElement(childIsDisjunction, new ArrayList<>(), new ArrayList<>());
+            children.add(child);
+            return child;
+        }
+
+        public boolean isEmpty()
+        {
+            if (!expressions.isEmpty())
+                return false;
+
+            for (FilterElement child : children)
+                if (!child.isEmpty())
+                    return false;
+
+            return true;
+        }
+
+        /**
+         * @return every leaf expression of this node and its descendants, in document order
+         */
+        public List<Expression> leaves()
+        {
+            List<Expression> allLeaves = new ArrayList<>(expressions.size());
+            gatherLeaves(allLeaves);
+            return allLeaves;
+        }
+
+        private void gatherLeaves(List<Expression> collector)
+        {
+            collector.addAll(expressions);
+            for (FilterElement child : children)
+                child.gatherLeaves(collector);
+        }
+
+        public boolean containsDisjunction()
+        {
+            if (isDisjunction)
+                return true;
+
+            for (FilterElement child : children)
+                if (child.containsDisjunction())
+                    return true;
+
+            return false;
+        }
+
+        boolean restrictsOnlyStaticOrPartitionKeyColumns()
+        {
+            for (Expression e : leaves())
+                if (!e.column().isStatic() && !e.column().isPartitionKey())
+                    return false;
+
+            return true;
+        }
+
+        /**
+         * A conjunction node over two or more mutable entities cannot be evaluated strictly against
+         * local, possibly partial, rows when the read needs reconciliation, because each replica may
+         * hold only some of the intersected cells. Disjunctions only widen results, which is the safe
+         * direction, so they never count.
+         *
+         * @return true if this node intersects either any static column or two distinct mutable
+         * columns, counting the columns of its local expressions and all of its descendants
+         *
+         * @see <a href="https://issues.apache.org/jira/browse/CASSANDRA-19018">CASSANDRA-19018</a>
+         */
+        public boolean isMutableIntersection()
+        {
+            if (isDisjunction)
+                return false;
+
+            // A single conjunct is not an intersection, whatever columns it spans
+            if (expressions.size() + children.size() < 2)
+                return false;
+
+            Set<ColumnMetadata> columns = null;
+            for (Expression e : leaves())
+            {
+                if (e.column().isStatic())
+                    return true;
+
+                if (!e.column().isPrimaryKeyColumn())
+                {
+                    if (columns == null)
+                        columns = new HashSet<>();
+
+                    columns.add(e.column());
+                    if (columns.size() > 1)
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        /**
+         * @return true if this node or any of its descendants is a mutable intersection
+         */
+        public boolean hasMutableIntersection()
+        {
+            if (isMutableIntersection())
+                return true;
+
+            for (FilterElement child : children)
+                if (child.hasMutableIntersection())
+                    return true;
+
+            return false;
+        }
+
+        /**
+         * Strict evaluation of this node against the given row. Conjunctions require every local
+         * expression and child to match, disjunctions require at least one. Static leaves are
+         * evaluated against the given static row so that they work inside disjunctions evaluated
+         * per row.
+         */
+        public boolean isSatisfiedBy(TableMetadata metadata, DecoratedKey partitionKey, Row row, Row staticRow, long nowInSec)
+        {
+            for (Expression e : expressions)
+            {
+                Row localRow = e.column().isStatic() ? staticRow : row;
+                if (e.isSatisfiedBy(metadata, partitionKey, localRow, nowInSec) == isDisjunction)
+                    return isDisjunction;
+            }
+
+            for (FilterElement child : children)
+            {
+                if (child.isSatisfiedBy(metadata, partitionKey, row, staticRow, nowInSec) == isDisjunction)
+                    return isDisjunction;
+            }
+
+            return !isDisjunction;
+        }
+
+        @Override
+        public String toString()
+        {
+            return toString(false);
+        }
+
+        private String toString(boolean cql)
+        {
+            StringBuilder sb = new StringBuilder();
+            String separator = isDisjunction ? " OR " : " AND ";
+            for (Expression e : expressions)
+            {
+                if (sb.length() > 0)
+                    sb.append(separator);
+                sb.append(e.toString(cql));
+            }
+            for (FilterElement child : children)
+            {
+                if (sb.length() > 0)
+                    sb.append(separator);
+                sb.append('(').append(child.toString(cql)).append(')');
+            }
+            return sb.toString();
+        }
     }
 
     public static abstract class Expression
@@ -1204,30 +1450,86 @@ public class RowFilter implements Iterable<RowFilter.Expression>
     {
         public void serialize(RowFilter filter, DataOutputPlus out, int version) throws IOException
         {
+            // Only VERSION_AXON_50 peers understand the tree format, so older peers get the legacy
+            // flat format, which cannot represent a disjunction. Flattening one would decode as a
+            // conjunction on the peer and silently under select, so we throw instead. The statement
+            // layer refuses disjunctive queries before dispatch, this is the backstop.
+            if (version >= MessagingService.VERSION_AXON_50)
+            {
+                serialize(filter.root, out, version);
+                return;
+            }
+
+            if (filter.containsDisjunction())
+                throw new IllegalStateException("Cannot serialize a disjunctive row filter to a node on messaging version " + version);
+
             out.writeBoolean(false); // Old "is for thrift" boolean
-            out.writeUnsignedVInt32(filter.expressions.size());
-            for (Expression expr : filter.expressions)
+            out.writeUnsignedVInt32(filter.root.expressions().size());
+            for (Expression expr : filter.root.expressions())
                 Expression.serializer.serialize(expr, out, version);
 
         }
 
+        private void serialize(FilterElement element, DataOutputPlus out, int version) throws IOException
+        {
+            out.writeByte(element.isDisjunction() ? 1 : 0);
+            out.writeUnsignedVInt32(element.expressions().size());
+            for (Expression expr : element.expressions())
+                Expression.serializer.serialize(expr, out, version);
+            out.writeUnsignedVInt32(element.children().size());
+            for (FilterElement child : element.children())
+                serialize(child, out, version);
+        }
+
         public RowFilter deserialize(DataInputPlus in, int version, TableMetadata metadata, boolean needsReconciliation) throws IOException
         {
+            if (version >= MessagingService.VERSION_AXON_50)
+                return new RowFilter(deserializeElement(in, version, metadata), needsReconciliation);
+
             in.readBoolean(); // Unused
             int size = in.readUnsignedVInt32();
             List<Expression> expressions = new ArrayList<>(size);
             for (int i = 0; i < size; i++)
                 expressions.add(Expression.serializer.deserialize(in, version, metadata));
 
-            return new RowFilter(expressions, needsReconciliation);
+            return new RowFilter(new FilterElement(false, expressions, new ArrayList<>()), needsReconciliation);
+        }
+
+        private FilterElement deserializeElement(DataInputPlus in, int version, TableMetadata metadata) throws IOException
+        {
+            boolean isDisjunction = (in.readByte() & 1) == 1;
+            int expressionCount = in.readUnsignedVInt32();
+            List<Expression> expressions = new ArrayList<>(expressionCount);
+            for (int i = 0; i < expressionCount; i++)
+                expressions.add(Expression.serializer.deserialize(in, version, metadata));
+            int childCount = in.readUnsignedVInt32();
+            List<FilterElement> children = new ArrayList<>(childCount);
+            for (int i = 0; i < childCount; i++)
+                children.add(deserializeElement(in, version, metadata));
+            return new FilterElement(isDisjunction, expressions, children);
         }
 
         public long serializedSize(RowFilter filter, int version)
         {
+            if (version >= MessagingService.VERSION_AXON_50)
+                return serializedSize(filter.root, version);
+
             long size = 1 // unused boolean
-                      + TypeSizes.sizeofUnsignedVInt(filter.expressions.size());
-            for (Expression expr : filter.expressions)
+                      + TypeSizes.sizeofUnsignedVInt(filter.root.expressions().size());
+            for (Expression expr : filter.root.expressions())
                 size += Expression.serializer.serializedSize(expr, version);
+            return size;
+        }
+
+        private long serializedSize(FilterElement element, int version)
+        {
+            long size = 1 // flags byte
+                      + TypeSizes.sizeofUnsignedVInt(element.expressions().size());
+            for (Expression expr : element.expressions())
+                size += Expression.serializer.serializedSize(expr, version);
+            size += TypeSizes.sizeofUnsignedVInt(element.children().size());
+            for (FilterElement child : element.children())
+                size += serializedSize(child, version);
             return size;
         }
     }

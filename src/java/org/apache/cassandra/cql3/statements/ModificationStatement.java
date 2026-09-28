@@ -82,6 +82,9 @@ public abstract class ModificationStatement implements CQLStatement.SingleKeyspa
     public static final String CUSTOM_EXPRESSIONS_NOT_ALLOWED =
         "Custom index expressions cannot be used in WHERE clauses for UPDATE or DELETE statements";
 
+    public static final String DISJUNCTIONS_NOT_ALLOWED =
+        "OR is not supported in UPDATE or DELETE statements";
+
     public static final ColumnIdentifier CAS_RESULT_COLUMN = new ColumnIdentifier("[applied]", false);
 
     protected final StatementType type;
@@ -1042,6 +1045,9 @@ public abstract class ModificationStatement implements CQLStatement.SingleKeyspa
         {
             if (where.containsCustomExpressions())
                 throw new InvalidRequestException(CUSTOM_EXPRESSIONS_NOT_ALLOWED);
+
+            if (where.containsDisjunction())
+                throw new InvalidRequestException(DISJUNCTIONS_NOT_ALLOWED);
 
             boolean applyOnlyToStaticColumns = appliesOnlyToStaticColumns(operations, conditions);
             return new StatementRestrictions(state, type, metadata, where, boundNames, orderings, applyOnlyToStaticColumns, false, false);

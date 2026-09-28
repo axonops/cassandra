@@ -80,10 +80,23 @@ public class FilterTree
     {
         boolean result = localSatisfiedBy(key, row, staticRow);
 
+        // The strictness downgrade must also apply when combining child subtree results, or an
+        // intersection like X AND (Y OR Z) would still drop rows whose conjuncts live on
+        // different replicas
+        BooleanOperator effectiveOperator = effectiveOperator();
         for (FilterTree child : children)
-            result = baseOperator.apply(result, child.isSatisfiedBy(key, row, staticRow));
+            result = effectiveOperator.apply(result, child.isSatisfiedBy(key, row, staticRow));
 
         return result;
+    }
+
+    /**
+     * Downgrades AND to OR unless the coordinator indicates strict filtering is safe or all
+     * matches are repaired.
+     */
+    private BooleanOperator effectiveOperator()
+    {
+        return (isStrict || !context.hasUnrepairedMatches) ? baseOperator : BooleanOperator.OR;
     }
 
     private boolean localSatisfiedBy(DecoratedKey key, Row row, Row staticRow)
@@ -92,8 +105,7 @@ public class FilterTree
             return false;
 
         final long now = FBUtilities.nowInSeconds();
-        // Downgrade AND to OR unless the coordinator indicates strict filtering is safe or all matches are repaired:
-        BooleanOperator localOperator = (isStrict || !context.hasUnrepairedMatches) ? baseOperator : BooleanOperator.OR;
+        BooleanOperator localOperator = effectiveOperator();
         boolean result = localOperator == BooleanOperator.AND;
 
         // If all matches on indexed columns are repaired, strict filtering is not allowed, and there are multiple

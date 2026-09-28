@@ -192,14 +192,54 @@ an `index_analyzer`:
 LWT IF conditions are unaffected: they always compare raw bytes, so under `MATCH` a
 SELECT with `=` and an IF condition with `=` can disagree by design.
 
+## The `OR` operator
+
+WHERE clauses accept `OR` between predicates, with `AND` binding tighter and parentheses
+overriding precedence:
+
+    SELECT * FROM ks.articles WHERE category = 'news' OR (score > 100 AND body : 'fox');
+
+Semantics are those of strict boolean evaluation over the reconciled row: a row is
+returned when the merged, newest version of its data satisfies the expression. Rows
+matching several disjuncts are returned once. Analyzed `:` and `PHRASE` predicates keep
+their own semantics inside a disjunction, so the tokens of one `:` value stay AND
+combined within that predicate.
+
+Restrictions in this cut, each refused with a clear error:
+
+* `OR` may only touch regular and static columns. Partition key columns (including
+  `token()`), and clustering columns are not supported inside `OR`.
+* `IN`, `LIKE`, `IS NOT NULL`, `expr()` custom index expressions and ANN cannot appear
+  inside `OR`, and a query combining `OR` with ANN ordering or a custom index expression
+  is refused as a whole.
+* A partition key `IN` restriction cannot be combined with `OR` anywhere in the query,
+  since a query containing `OR` always runs as one contiguous range read.
+* `OR` is not supported in UPDATE or DELETE statements, in LWT IF conditions (not
+  expressible), in materialized view definitions, or on virtual tables.
+
+ALLOW FILTERING rule: a disjunction runs on the SAI index path, with one index union per
+`OR`, when every predicate of every branch has a storage-attached index (the only index
+implementation that understands disjunctions). Otherwise the whole query requires
+ALLOW FILTERING and is evaluated by filtering. There is no cost model for unions in this
+cut, so very unselective disjunctions can materialize large key sets; the standard SAI
+guardrails still apply per predicate.
+
+Static columns may appear inside `OR`. One boundary case to know: a partition whose only
+content is a matching static row (no regular rows at all) produces no result row for a
+disjunction that also restricts regular columns, on the index path and the filtering path
+alike. The synthetic row Cassandra emits for row-less partitions is reserved for queries
+without regular column restrictions, exactly as for conjunctions.
+
 ## Cluster upgrade rule
 
-The `:` and `PHRASE` operators, and `=` under `MATCH` behaviour, are refused with an
-InvalidRequest error until every node in the cluster runs this build. Nodes advertise a
-fork messaging version and the coordinator checks that all live peers speak it before
-accepting one of these queries. During a rolling upgrade the queries fail fast with a
-message naming a node that has not been upgraded, instead of returning wrong results
-from a node that cannot evaluate them.
+The `:` and `PHRASE` operators, `=` under `MATCH` behaviour, and `OR` in WHERE clauses
+are refused with an InvalidRequest error until every node in the cluster runs this build.
+Nodes advertise a fork messaging version and the coordinator checks that all live peers
+speak it before accepting one of these queries. During a rolling upgrade the queries fail
+fast with a message naming a node that has not been upgraded, instead of returning wrong
+results from a node that cannot evaluate them. As a backstop, a filter containing `OR`
+refuses to serialize towards a peer on the vanilla messaging version rather than ever
+flattening to a conjunction.
 
 A node only advertises the fork version when its `storage_compatibility_mode` is
 not `CASSANDRA_4` (that is, `UPGRADING` or `NONE`). Clusters still running with
@@ -212,6 +252,8 @@ exactly like other 5.0-level features.
 With tracing enabled these queries emit events at each decision point:
 
 * how the query analyzer tokenized the queried value, tokens with positions
+* the shape of the index query tree, operators and expression counts per node, for
+  queries containing `OR`
 * per segment phrase intersection statistics, candidates in and matches out, for both
   memtable and sstable segments
 * post-filter counts, rows matched of rows checked, on replicas and on the coordinator
@@ -221,6 +263,5 @@ With tracing enabled these queries emit events at each decision point:
 
 Coming in later commits on this branch:
 
-* `OR` in queries against analyzed indexes
 * BM25 relevance scoring and `ORDER BY`
 * metrics for dropped values, oversize tokens and analyzer config errors

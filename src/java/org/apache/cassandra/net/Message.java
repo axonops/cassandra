@@ -1098,6 +1098,7 @@ public class Message<T>
 
     private int serializedSize40;
     private int serializedSize50;
+    private int serializedSizeAxon50;
 
     /**
      * Serialized size of the entire message, for the provided messaging version. Caches the calculated value.
@@ -1111,11 +1112,14 @@ public class Message<T>
                     serializedSize40 = serializer.serializedSize(this, VERSION_40);
                 return serializedSize40;
             case VERSION_50:
-            // VERSION_AXON_50 is wire-identical to VERSION_50, so it shares the cached size
-            case MessagingService.VERSION_AXON_50:
                 if (serializedSize50 == 0)
                     serializedSize50 = serializer.serializedSize(this, VERSION_50);
                 return serializedSize50;
+            // VERSION_AXON_50 carries the RowFilter tree format, so its size is cached separately
+            case MessagingService.VERSION_AXON_50:
+                if (serializedSizeAxon50 == 0)
+                    serializedSizeAxon50 = serializer.serializedSize(this, MessagingService.VERSION_AXON_50);
+                return serializedSizeAxon50;
             default:
                 throw new IllegalStateException("Unkown serialization version " + version);
         }
@@ -1123,6 +1127,7 @@ public class Message<T>
 
     private int payloadSize40   = -1;
     private int payloadSize50   = -1;
+    private int payloadSizeAxon50 = -1;
 
     private int payloadSize(int version)
     {
@@ -1133,11 +1138,14 @@ public class Message<T>
                     payloadSize40 = serializer.payloadSize(this, VERSION_40);
                 return payloadSize40;
             case VERSION_50:
-            // VERSION_AXON_50 is wire-identical to VERSION_50, so it shares the cached size
-            case MessagingService.VERSION_AXON_50:
                 if (payloadSize50 < 0)
                     payloadSize50 = serializer.payloadSize(this, VERSION_50);
                 return payloadSize50;
+            // VERSION_AXON_50 carries the RowFilter tree format, so its size is cached separately
+            case MessagingService.VERSION_AXON_50:
+                if (payloadSizeAxon50 < 0)
+                    payloadSizeAxon50 = serializer.payloadSize(this, MessagingService.VERSION_AXON_50);
+                return payloadSizeAxon50;
 
             default:
                 throw new IllegalStateException("Unkown serialization version " + version);

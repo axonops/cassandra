@@ -45,6 +45,7 @@ import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
 import org.apache.cassandra.index.sai.analyzer.AnalyzedToken;
 import org.apache.cassandra.index.sai.disk.v1.vector.PrimaryKeyWithScore;
 import org.apache.cassandra.index.sai.iterators.KeyRangeIterator;
+import org.apache.cassandra.index.sai.iterators.KeyRangeUnionIterator;
 import org.apache.cassandra.index.sai.utils.IndexTermType;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.tracing.Tracing;
@@ -373,7 +374,11 @@ public class Operation
      */
     static KeyRangeIterator buildIterator(QueryController controller)
     {
-        return Node.buildTree(controller.indexFilter()).analyzeTree(controller).rangeIterator(controller);
+        Node node = Node.buildTree(controller.indexFilter()).analyzeTree(controller);
+        // Scoped to disjunctions so queries without OR keep their existing trace output
+        if (Tracing.isTracing() && controller.indexFilter().containsDisjunction())
+            Tracing.trace("Executing index query tree {}", node.treeDescription());
+        return node.rangeIterator(controller);
     }
 
     /**
@@ -393,17 +398,21 @@ public class Operation
     }
 
     /**
-     * Converts expressions into filter tree (which is currently just a single AND).
+     * Converts expressions into a filter tree mirroring the {@link RowFilter} tree shape.
      * <p>
      * Filter tree allows us to do a couple of important optimizations
      * namely, group flattening for AND operations (query rewrite), expression bounds checks,
      * "satisfies by" checks for resulting rows with an early exit.
      *
+     * @param forceStrict when true every node filters strictly, used by the coordinator re-check
+     * over merged rows. When false each AND node applies its own per node strictness computed
+     * from the row filter tree.
+     *
      * @return root of the filter tree.
      */
-    static FilterTree buildFilter(QueryController controller, boolean strict)
+    static FilterTree buildFilter(QueryController controller, boolean forceStrict)
     {
-        return Node.buildTree(controller.indexFilter()).buildFilter(controller, strict);
+        return Node.buildTree(controller.indexFilter()).buildFilter(controller, forceStrict);
     }
 
     static abstract class Node
@@ -432,15 +441,43 @@ public class Operation
 
         abstract void analyze(List<RowFilter.Expression> expressionList, QueryController controller);
 
-        abstract FilterTree filterTree(boolean strict, QueryContext context);
+        abstract FilterTree filterTree(boolean forceStrict, QueryContext context);
 
         abstract KeyRangeIterator rangeIterator(QueryController controller);
 
         static Node buildTree(RowFilter filterOperation)
         {
-            OperatorNode node = new AndNode();
-            for (RowFilter.Expression expression : filterOperation.getExpressions())
-                node.add(buildExpression(expression));
+            return buildTree(filterOperation.root(), filterOperation.needsReconciliation());
+        }
+
+        private static Node buildTree(RowFilter.FilterElement element, boolean needsReconciliation)
+        {
+            OperatorNode node;
+            if (element.isDisjunction())
+            {
+                node = new OrNode();
+                // Every direct leaf of a disjunction gets its own AND branch node, so that no
+                // analysis can ever pool or fold expressions across OR branches. A same column
+                // pair like x < 5 OR x > 10 folded into one range would produce an empty match.
+                for (RowFilter.Expression expression : element.expressions())
+                {
+                    AndNode branch = new AndNode(true);
+                    branch.add(buildExpression(expression));
+                    node.add(branch);
+                }
+            }
+            else
+            {
+                // A conjunction intersecting several mutable columns cannot be evaluated
+                // strictly on a replica when reads need reconciliation (CASSANDRA-19018)
+                node = new AndNode(!(needsReconciliation && element.isMutableIntersection()));
+                for (RowFilter.Expression expression : element.expressions())
+                    node.add(buildExpression(expression));
+            }
+
+            for (RowFilter.FilterElement child : element.children())
+                node.add(buildTree(child, needsReconciliation));
+
             return node;
         }
 
@@ -471,14 +508,49 @@ public class Operation
             }
         }
 
-        FilterTree buildFilter(QueryController controller, boolean isStrict)
+        FilterTree buildFilter(QueryController controller, boolean forceStrict)
         {
             analyzeTree(controller);
-            FilterTree tree = filterTree(isStrict, controller.queryContext);
+            return doBuildFilter(forceStrict, controller.queryContext);
+        }
+
+        private FilterTree doBuildFilter(boolean forceStrict, QueryContext context)
+        {
+            FilterTree tree = filterTree(forceStrict, context);
             for (Node child : children())
                 if (child.canFilter())
-                    tree.addChild(child.buildFilter(controller, isStrict));
+                    tree.addChild(child.doBuildFilter(forceStrict, context));
             return tree;
+        }
+
+        /**
+         * @return a compact description of the tree shape for tracing, operators and expression
+         * counts only, never values
+         */
+        String treeDescription()
+        {
+            StringBuilder sb = new StringBuilder();
+            describe(sb);
+            return sb.toString();
+        }
+
+        void describe(StringBuilder sb)
+        {
+            sb.append(getClass().getSimpleName())
+              .append('[')
+              .append(expressions == null ? 0 : expressions.size())
+              .append(']');
+            if (!children().isEmpty())
+            {
+                sb.append('(');
+                for (int i = 0; i < children().size(); i++)
+                {
+                    if (i > 0)
+                        sb.append(", ");
+                    children().get(i).describe(sb);
+                }
+                sb.append(')');
+            }
         }
     }
 
@@ -501,6 +573,17 @@ public class Operation
 
     static class AndNode extends OperatorNode
     {
+        /**
+         * Whether this node's intersection may be evaluated strictly on this replica, see
+         * {@link RowFilter.FilterElement#isMutableIntersection()}.
+         */
+        private final boolean strict;
+
+        AndNode(boolean strict)
+        {
+            this.strict = strict;
+        }
+
         @Override
         public void analyze(List<RowFilter.Expression> expressionList, QueryController controller)
         {
@@ -508,21 +591,51 @@ public class Operation
         }
 
         @Override
-        FilterTree filterTree(boolean isStrict, QueryContext context)
+        FilterTree filterTree(boolean forceStrict, QueryContext context)
         {
-            return new FilterTree(BooleanOperator.AND, expressions, isStrict, context);
+            return new FilterTree(BooleanOperator.AND, expressions, forceStrict || strict, context);
         }
 
         @Override
         KeyRangeIterator rangeIterator(QueryController controller)
         {
-            KeyRangeIterator.Builder builder = controller.getIndexQueryResults(expressions.all());
+            KeyRangeIterator.Builder builder = controller.getIndexQueryResults(expressions.all(), strict);
             for (Node child : children)
             {
                 boolean canFilter = child.canFilter();
                 if (canFilter)
                     builder.add(child.rangeIterator(controller));
             }
+            return builder.build();
+        }
+    }
+
+    static class OrNode extends OperatorNode
+    {
+        @Override
+        public void analyze(List<RowFilter.Expression> expressionList, QueryController controller)
+        {
+            // Direct leaves are wrapped in their own AND branch nodes at build time, so a
+            // disjunction never pools expressions of its own
+            assert expressionList.isEmpty() : "Disjunction nodes should not pool expressions";
+            expressions = buildIndexExpressions(controller, expressionList);
+        }
+
+        @Override
+        FilterTree filterTree(boolean forceStrict, QueryContext context)
+        {
+            // A union only widens results, which is the safe direction under reconciliation,
+            // so a disjunction never needs the strictness downgrade
+            return new FilterTree(BooleanOperator.OR, expressions, true, context);
+        }
+
+        @Override
+        KeyRangeIterator rangeIterator(QueryController controller)
+        {
+            KeyRangeUnionIterator.Builder builder = KeyRangeUnionIterator.builder(children.size());
+            for (Node child : children)
+                if (child.canFilter())
+                    builder.add(child.rangeIterator(controller));
             return builder.build();
         }
     }
@@ -539,10 +652,10 @@ public class Operation
         }
 
         @Override
-        FilterTree filterTree(boolean isStrict, QueryContext context)
+        FilterTree filterTree(boolean forceStrict, QueryContext context)
         {
-            // There should only be one expression, so AND/OR would both work here. 
-            return new FilterTree(BooleanOperator.AND, expressions, isStrict, context);
+            // There should only be one expression, so AND/OR would both work here.
+            return new FilterTree(BooleanOperator.AND, expressions, true, context);
         }
 
         public ExpressionNode(RowFilter.Expression expression)
@@ -561,7 +674,7 @@ public class Operation
         {
             assert canFilter() : "Cannot process query with no expressions";
 
-            return controller.getIndexQueryResults(expressions.all()).build();
+            return controller.getIndexQueryResults(expressions.all(), true).build();
         }
     }
 }

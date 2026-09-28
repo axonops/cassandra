@@ -273,6 +273,9 @@ public final class CreateViewStatement extends AlterSchemaStatement
         if (whereClause.containsCustomExpressions())
             throw ire("WHERE clause for materialized view '%s' cannot contain custom index expressions", viewName);
 
+        if (whereClause.containsDisjunction())
+            throw ire("WHERE clause for materialized view '%s' cannot contain OR", viewName);
+
         StatementRestrictions restrictions =
             new StatementRestrictions(state,
                                       StatementType.SELECT,

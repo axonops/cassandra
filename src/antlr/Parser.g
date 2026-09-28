@@ -446,12 +446,26 @@ sident returns [Selectable.RawIdentifier id]
 
 whereClause returns [WhereClause.Builder clause]
     @init{ $clause = new WhereClause.Builder(); }
-    : relationOrExpression[$clause] (K_AND relationOrExpression[$clause])*
+    : e=disjunction { $clause.root(e); }
     ;
 
-relationOrExpression [WhereClause.Builder clause]
-    : relation[$clause]
-    | customIndexExpression[$clause]
+disjunction returns [WhereClause.ExpressionElement element]
+    @init{ List<WhereClause.ExpressionElement> parts = new ArrayList<>(); }
+    : c=conjunction { if (c != null) parts.add(c); } (K_OR c=conjunction { if (c != null) parts.add(c); })*
+      { $element = WhereClause.ExpressionElement.or(parts); }
+    ;
+
+conjunction returns [WhereClause.ExpressionElement element]
+    @init{ List<WhereClause.ExpressionElement> parts = new ArrayList<>(); }
+    : p=boolPrimary { if (p != null) parts.add(p); } (K_AND p=boolPrimary { if (p != null) parts.add(p); })*
+      { $element = WhereClause.ExpressionElement.and(parts); }
+    ;
+
+boolPrimary returns [WhereClause.ExpressionElement element]
+    @init{ WhereClause.Builder receiver = new WhereClause.Builder(); }
+    : relation[receiver] { $element = receiver.extractParsed(); }
+    | customIndexExpression[receiver] { $element = receiver.extractParsed(); }
+    | '(' e=disjunction ')' { $element = e; }
     ;
 
 customIndexExpression [WhereClause.Builder clause]
@@ -1804,7 +1818,6 @@ relation[WhereClause.Builder clauses]
       | type=relationType tupleMarker=markerForTuple /* (a, b, c) >= ? */
           { $clauses.add(MultiColumnRelation.createNonInRelation(ids, type, tupleMarker)); }
       )
-    | '(' relation[$clauses] ')'
     ;
 
 containsOperator returns [Operator o]

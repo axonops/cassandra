@@ -151,11 +151,6 @@ public class QueryController
     {
         return this.indexFilter;
     }
-    
-    public boolean usesStrictFiltering()
-    {
-        return command.rowFilter().isStrict();
-    }
 
     /**
      * @return token ranges used in the read command
@@ -237,21 +232,24 @@ public class QueryController
      * The results from each call to {@link IndexSearchResultIterator#build(QueryViewBuilder.QueryExpressionView, AbstractBounds, QueryContext, boolean, Runnable)}
      * are added to a {@link KeyRangeIntersectionIterator} and returned if strict filtering is allowed.
      * <p>
-     * If strict filtering is not allowed, indexes are split into two groups according to the repaired status of their 
-     * backing SSTables. Results from searches over the repaired group are added to a 
+     * If strict filtering is not allowed, indexes are split into two groups according to the repaired status of their
+     * backing SSTables. Results from searches over the repaired group are added to a
      * {@link KeyRangeIntersectionIterator}, which is then added, along with results from searches on the unrepaired
      * set, to a top-level {@link KeyRangeUnionIterator}, and returned. This is done to ensure that AND queries do not
      * prematurely filter out matches on un-repaired partial updates. Post-filtering must also take this into
-     * account. (see {@link FilterTree#isSatisfiedBy(DecoratedKey, Row, Row)}) Note that Memtable-attached 
+     * account. (see {@link FilterTree#isSatisfiedBy(DecoratedKey, Row, Row)}) Note that Memtable-attached
      * indexes are treated as part of the unrepaired set.
+     *
+     * @param strict whether the calling plan node may intersect strictly, computed per node from
+     * the row filter tree (see {@link RowFilter.FilterElement#isMutableIntersection()})
      */
-    public KeyRangeIterator.Builder getIndexQueryResults(Collection<Expression> expressions)
+    public KeyRangeIterator.Builder getIndexQueryResults(Collection<Expression> expressions, boolean strict)
     {
         // VSTODO move ANN out of expressions and into its own abstraction? That will help get generic ORDER BY support
         expressions = expressions.stream().filter(e -> e.getIndexOperator() != Expression.IndexOperator.ANN).collect(Collectors.toList());
 
         QueryViewBuilder.QueryView queryView = new QueryViewBuilder(expressions, mergeRange).build();
-        KeyRangeIterator.Builder builder = command.rowFilter().isStrict()
+        KeyRangeIterator.Builder builder = strict
                                            ? KeyRangeIntersectionIterator.builder(expressions.size(), queryView::close)
                                            : KeyRangeUnionIterator.builder(expressions.size(), queryView::close);
 
@@ -259,7 +257,7 @@ public class QueryController
         {
             maybeTriggerGuardrails(queryView);
 
-            if (command.rowFilter().isStrict())
+            if (strict)
             {
                 // If strict filtering is enabled, evaluate indexes for both repaired and un-repaired SSTables together.
                 // This usually means we are making this local index query in the context of a user query that reads 

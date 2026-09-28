@@ -68,6 +68,7 @@ import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.exceptions.*;
 import org.apache.cassandra.metrics.ClientRequestSizeMetrics;
 import org.apache.cassandra.index.IndexRegistry;
+import org.apache.cassandra.index.sai.ClusterVersionGate;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.ClientWarn;
@@ -984,6 +985,12 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
     {
         IndexRegistry indexRegistry = IndexRegistry.obtain(table);
         RowFilter filter = restrictions.getRowFilter(indexRegistry, options);
+
+        // A disjunctive filter reaches replicas through its tree serialization, which peers below
+        // VERSION_AXON_50 cannot decode, so refuse OR until every node runs this build. The
+        // RowFilter serializer throws rather than flatten as the backstop for gate races.
+        if (filter.containsDisjunction())
+            ClusterVersionGate.checkClusterSupports("OR in WHERE clauses");
 
         if (filter.needsReconciliation() && filter.isMutableIntersection() && restrictions.needFiltering(table))
             Guardrails.intersectFilteringQueryEnabled.ensureEnabled(state);

@@ -3281,4 +3281,133 @@ public class SelectTest extends CQLTester
 
         assertRows(execute("SELECT udt_data FROM " + KEYSPACE + ".t4"), row(userType("random", "I'm newb")));
     }
+
+    @Test
+    public void testDisjunctionRequiresAllowFiltering() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, a int, b int)");
+
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
+                             "SELECT * FROM %s WHERE a = 1 OR b = 2");
+    }
+
+    @Test
+    public void testDisjunctionWithAllowFiltering() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, a int, b int, c int)");
+        execute("INSERT INTO %s (pk, a, b, c) VALUES (1, 1, 9, 9)");
+        execute("INSERT INTO %s (pk, a, b, c) VALUES (2, 9, 2, 9)");
+        execute("INSERT INTO %s (pk, a, b, c) VALUES (3, 9, 9, 9)");
+        execute("INSERT INTO %s (pk, a, b, c) VALUES (4, 1, 2, 9)");
+        execute("INSERT INTO %s (pk, a, b, c) VALUES (5, 9, 2, 3)");
+
+        // A row matching both disjuncts is returned once
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE a = 1 OR b = 2 ALLOW FILTERING"),
+                                row(1), row(2), row(4), row(5));
+
+        // AND binds tighter than OR
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE a = 1 OR b = 2 AND c = 3 ALLOW FILTERING"),
+                                row(1), row(4), row(5));
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (a = 1 OR b = 2) AND c = 3 ALLOW FILTERING"),
+                                row(5));
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (a = 9 AND b = 2) OR c = 9 ALLOW FILTERING"),
+                                row(1), row(2), row(3), row(4), row(5));
+
+        // Same column disjuncts
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE a = 1 OR a = 9 ALLOW FILTERING"),
+                                row(1), row(2), row(3), row(4), row(5));
+
+        // A slice branch keeps its bounds conjoined inside the branch
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (b > 1 AND b < 9) OR c = 3 ALLOW FILTERING"),
+                                row(2), row(4), row(5));
+
+        // Bind markers inside disjunctions
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE a = ? OR b = ? ALLOW FILTERING", 1, 2),
+                                row(1), row(2), row(4), row(5));
+
+        // Aggregation, GROUP BY and LIMIT consume the already filtered rows
+        assertRows(execute("SELECT count(*) FROM %s WHERE a = 1 OR b = 2 ALLOW FILTERING"), row(4L));
+        assertRowCount(execute("SELECT pk, count(*) FROM %s WHERE a = 1 OR b = 2 GROUP BY pk ALLOW FILTERING"), 4);
+        assertRowCount(execute("SELECT pk FROM %s WHERE a = 1 OR b = 2 LIMIT 2 ALLOW FILTERING"), 2);
+    }
+
+    @Test
+    public void testDisjunctionWithStaticColumns() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, s int static, v int, PRIMARY KEY (pk, ck))");
+        execute("INSERT INTO %s (pk, s) VALUES (1, 1)");
+        execute("INSERT INTO %s (pk, ck, v) VALUES (1, 1, 9)");
+        execute("INSERT INTO %s (pk, ck, v) VALUES (2, 1, 2)");
+        execute("INSERT INTO %s (pk, ck, v) VALUES (3, 1, 9)");
+
+        assertRowsIgnoringOrder(execute("SELECT pk, ck FROM %s WHERE s = 1 OR v = 2 ALLOW FILTERING"),
+                                row(1, 1), row(2, 1));
+
+        // A partition whose only content is a matching static row produces no row here: queries
+        // restricted on regular columns never emit the synthetic row of a row-less partition,
+        // with or without an index (see staticOnlyPartitionParityWithFiltering in the SAI tests)
+        execute("INSERT INTO %s (pk, s) VALUES (4, 1)");
+        assertRowsIgnoringOrder(execute("SELECT pk, ck FROM %s WHERE s = 1 OR v = 2 ALLOW FILTERING"),
+                                row(1, 1), row(2, 1));
+    }
+
+    @Test
+    public void testDisjunctionExclusions() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, v int, w int, PRIMARY KEY (pk, ck))");
+
+        assertInvalidMessage("Restrictions on partition key columns are not supported within OR expressions",
+                             "SELECT * FROM %s WHERE pk = 1 OR v = 1 ALLOW FILTERING");
+        assertInvalidMessage("Restrictions on partition key columns are not supported within OR expressions",
+                             "SELECT * FROM %s WHERE token(pk) > 0 OR v = 1 ALLOW FILTERING");
+        assertInvalidMessage("Restrictions on clustering columns are not supported within OR expressions",
+                             "SELECT * FROM %s WHERE ck = 1 OR v = 1 ALLOW FILTERING");
+        assertInvalidMessage("Restrictions on clustering columns are not supported within OR expressions",
+                             "SELECT * FROM %s WHERE (ck) > (1) OR v = 1 ALLOW FILTERING");
+        assertInvalidMessage("IN restrictions are not supported within OR expressions",
+                             "SELECT * FROM %s WHERE v IN (1, 2) OR w = 1 ALLOW FILTERING");
+        assertInvalidMessage("LIKE restrictions are not supported within OR expressions",
+                             "SELECT * FROM %s WHERE v LIKE 1 OR w = 1 ALLOW FILTERING");
+        assertInvalidMessage("IS NOT NULL restrictions are not supported within OR expressions",
+                             "SELECT * FROM %s WHERE v IS NOT NULL OR w = 1 ALLOW FILTERING");
+
+        assertInvalidMessage("IN restrictions on the partition key are not supported in queries containing OR",
+                             "SELECT * FROM %s WHERE pk IN (1, 2) AND (v = 1 OR w = 1) ALLOW FILTERING");
+
+        assertInvalidMessage("OR is not supported in UPDATE or DELETE statements",
+                             "UPDATE %s SET v = 1 WHERE pk = 1 AND ck = 1 OR ck = 2");
+        assertInvalidMessage("OR is not supported in UPDATE or DELETE statements",
+                             "DELETE FROM %s WHERE pk = 1 OR pk = 2");
+
+        // OR between LWT conditions is not expressible at all
+        assertInvalidSyntax("UPDATE %s SET v = 1 WHERE pk = 1 AND ck = 1 IF v = 1 OR v = 2");
+    }
+
+    @Test
+    public void testDisjunctionWithPartitionKeyConjunct() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, v int, w int, PRIMARY KEY (pk, ck))");
+        execute("INSERT INTO %s (pk, ck, v, w) VALUES (1, 1, 1, 9)");
+        execute("INSERT INTO %s (pk, ck, v, w) VALUES (1, 2, 9, 2)");
+        execute("INSERT INTO %s (pk, ck, v, w) VALUES (1, 3, 9, 9)");
+        execute("INSERT INTO %s (pk, ck, v, w) VALUES (2, 1, 1, 2)");
+
+        // A partition key conjunct outside the disjunction narrows the read
+        assertRowsIgnoringOrder(execute("SELECT pk, ck FROM %s WHERE pk = 1 AND (v = 1 OR w = 2) ALLOW FILTERING"),
+                                row(1, 1), row(1, 2));
+
+        // The same holds with a clustering conjunct
+        assertRowsIgnoringOrder(execute("SELECT pk, ck FROM %s WHERE pk = 1 AND ck = 1 AND (v = 1 OR w = 2) ALLOW FILTERING"),
+                                row(1, 1));
+    }
+
+    @Test
+    public void testDisjunctionRejectedInMaterializedViews() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, v int, PRIMARY KEY (pk, ck))");
+
+        assertInvalidMessage("WHERE clause for materialized view 'select_test_mv_or' cannot contain OR",
+                             "CREATE MATERIALIZED VIEW " + KEYSPACE + ".select_test_mv_or AS SELECT pk, ck, v FROM %s " +
+                             "WHERE pk IS NOT NULL AND (ck = 1 OR v = 1) PRIMARY KEY (pk, ck)");
+    }
 }

@@ -113,6 +113,19 @@ public final class StatementRestrictions
     private final IndexRestrictions filterRestrictions = new IndexRestrictions();
 
     /**
+     * The OR subtrees of the WHERE clause, one holder per root level disjunction. Their leaf
+     * restrictions are validated and used to build the row filter tree, but they never enter
+     * the conjunctive merge machinery above.
+     */
+    private final List<DisjunctionHolder> disjunctions = new ArrayList<>();
+
+    /**
+     * Whether the disjunctions must be evaluated by filtering because some leaf is not supported
+     * by an index group that understands OR.
+     */
+    private boolean disjunctionsNeedFiltering;
+
+    /**
      * <code>true</code> if the secondary index need to be queried, <code>false</code> otherwise
      */
     private boolean usesSecondaryIndexing;
@@ -182,6 +195,30 @@ public final class StatementRestrictions
 
         final IndexRegistry indexRegistry = type.allowUseOfSecondaryIndices() ? IndexRegistry.obtain(table) : null;
 
+        // The WHERE clause root is always a conjunction. Its leaf children are processed by the
+        // conjunctive merge machinery exactly as before, while OR subtrees are validated leaf by
+        // leaf and kept aside in per-subtree holders, never merged.
+        List<Relation> relations = new ArrayList<>();
+        List<CustomIndexExpression> customExpressions = new ArrayList<>();
+        List<WhereClause.OrElement> orElements = new ArrayList<>();
+        for (WhereClause.ExpressionElement element : whereClause.root().children())
+        {
+            if (element instanceof WhereClause.RelationElement)
+                relations.add(((WhereClause.RelationElement) element).relation());
+            else if (element instanceof WhereClause.CustomIndexExpressionElement)
+                customExpressions.add(((WhereClause.CustomIndexExpressionElement) element).expression());
+            else
+                orElements.add((WhereClause.OrElement) element);
+        }
+
+        if (!orElements.isEmpty() && table.isVirtual())
+            throw invalidRequest("OR is not supported on virtual tables");
+
+        // A custom index expression pins the query to its target index, which cannot execute a
+        // disjunctive filter, so the combination is refused outright
+        if (!orElements.isEmpty() && !customExpressions.isEmpty())
+            throw invalidRequest("Custom index expressions are not supported in queries containing OR");
+
         /*
          * WHERE clause. For a given entity, rules are:
          *   - EQ relation conflicts with anything else (including a 2nd EQ)
@@ -192,7 +229,7 @@ public final class StatementRestrictions
          *     in CQL so far)
          *   - CONTAINS and CONTAINS_KEY cannot be used with UPDATE or DELETE
          */
-        for (Relation relation : whereClause.relations)
+        for (Relation relation : relations)
         {
             if ((relation.isContains() || relation.isContainsKey() || relation.operator().isAnalyzed())
                 && (type.isUpdate() || type.isDelete()))
@@ -234,19 +271,23 @@ public final class StatementRestrictions
             }
         }
 
+        for (WhereClause.OrElement orElement : orElements)
+            disjunctions.add(prepareDisjunction(orElement, boundNames, indexRegistry));
+
         // ORDER BY clause.
         // Some indexes can be used for ordering.
         nonPrimaryKeyRestrictions = addOrderingRestrictions(orderings, nonPrimaryKeyRestrictions);
 
-        hasRegularColumnsRestrictions = nonPrimaryKeyRestrictions.hasRestrictionFor(ColumnMetadata.Kind.REGULAR);
+        hasRegularColumnsRestrictions = nonPrimaryKeyRestrictions.hasRestrictionFor(ColumnMetadata.Kind.REGULAR)
+                                        || disjunctionsRestrictRegularColumns();
 
         boolean hasQueriableClusteringColumnIndex = false;
         boolean hasQueriableIndex = false;
 
         if (allowUseOfSecondaryIndices)
         {
-            if (whereClause.containsCustomExpressions())
-                processCustomIndexExpressions(whereClause.expressions, boundNames, indexRegistry);
+            if (!customExpressions.isEmpty())
+                processCustomIndexExpressions(customExpressions, boundNames, indexRegistry);
 
             hasQueriableClusteringColumnIndex = clusteringColumnsRestrictions.hasSupportingIndex(indexRegistry);
             hasQueriableIndex = !filterRestrictions.getCustomIndexExpressions().isEmpty()
@@ -366,6 +407,43 @@ public final class StatementRestrictions
             filterRestrictions.add(nonPrimaryKeyRestrictions);
         }
 
+        // This block runs after the ones above consumed isKeyRange and usesSecondaryIndexing on
+        // purpose: partition key and clustering restrictions must never enter the row filter for
+        // a query whose only index interaction is its disjunctions. Correctness of the forced
+        // range read rests on getPartitionKeyBounds deriving exact partition bounds (IN is
+        // rejected below) and on the DataRange clustering filter applying the clustering
+        // restrictions. Moving this above them would flip those add decisions.
+        if (!disjunctions.isEmpty())
+        {
+            // Top-K plumbing consumes a single index result stream and is out of scope for OR
+            if (nonPrimaryKeyRestrictions.hasAnn())
+                throw invalidRequest("ANN ordering is not supported in queries containing OR");
+
+            // The range read below derives one contiguous partition bound, which cannot
+            // represent a partition key IN list
+            if (partitionKeyRestrictions.hasIN())
+                throw invalidRequest("IN restrictions on the partition key are not supported in queries containing OR");
+
+            // A disjunct can match rows in any partition, so the query is always a range read.
+            // Cut 1 does not optimize a partition restricted query with a disjunction into a
+            // slice read even though it could.
+            isKeyRange = true;
+
+            // A disjunction can only use an index when every leaf of every branch is supported
+            // by an index group that understands OR, otherwise it runs on the filtering path
+            disjunctionsNeedFiltering = !allowUseOfSecondaryIndices || !disjunctionsAreIndexSupported(indexRegistry);
+
+            if (disjunctionsNeedFiltering)
+            {
+                if (!allowFiltering && requiresAllowFilteringIfNotSpecified())
+                    throw invalidRequest(allowFilteringMessage(state));
+            }
+            else
+            {
+                usesSecondaryIndexing = true;
+            }
+        }
+
         if (usesSecondaryIndexing)
             validateSecondaryIndexSelections();
     }
@@ -391,11 +469,126 @@ public final class StatementRestrictions
             nonPrimaryKeyRestrictions = nonPrimaryKeyRestrictions.addRestriction((SingleRestriction) restriction);
     }
 
+    /**
+     * Validates one OR subtree of the WHERE clause and converts its relation leaves into
+     * restrictions, held per leaf and never merged.
+     */
+    private DisjunctionHolder prepareDisjunction(WhereClause.OrElement element,
+                                                 VariableSpecifications boundNames,
+                                                 IndexRegistry indexRegistry)
+    {
+        Map<WhereClause.RelationElement, SingleRestriction> leafRestrictions = new IdentityHashMap<>();
+        prepareDisjunctionLeaves(element, boundNames, indexRegistry, leafRestrictions);
+        return new DisjunctionHolder(element, leafRestrictions);
+    }
+
+    private void prepareDisjunctionLeaves(WhereClause.ContainerElement container,
+                                          VariableSpecifications boundNames,
+                                          IndexRegistry indexRegistry,
+                                          Map<WhereClause.RelationElement, SingleRestriction> leafRestrictions)
+    {
+        for (WhereClause.ExpressionElement child : container.children())
+        {
+            if (child instanceof WhereClause.ContainerElement)
+                prepareDisjunctionLeaves((WhereClause.ContainerElement) child, boundNames, indexRegistry, leafRestrictions);
+            else if (child instanceof WhereClause.CustomIndexExpressionElement)
+                throw invalidRequest("Custom index expressions are not supported within OR expressions");
+            else
+            {
+                WhereClause.RelationElement leaf = (WhereClause.RelationElement) child;
+                leafRestrictions.put(leaf, prepareDisjunctionLeaf(leaf.relation(), boundNames, indexRegistry));
+            }
+        }
+    }
+
+    private SingleRestriction prepareDisjunctionLeaf(Relation relation,
+                                                     VariableSpecifications boundNames,
+                                                     IndexRegistry indexRegistry)
+    {
+        if (relation.onToken())
+            throw invalidRequest("Restrictions on partition key columns are not supported within OR expressions");
+
+        if (relation.isIN())
+            throw invalidRequest("IN restrictions are not supported within OR expressions");
+
+        if (relation.isLIKE())
+            throw invalidRequest("LIKE restrictions are not supported within OR expressions");
+
+        if (relation.operator() == Operator.IS_NOT)
+            throw invalidRequest("IS NOT NULL restrictions are not supported within OR expressions");
+
+        if (relation.operator() == Operator.ANN)
+            throw invalidRequest("ANN restrictions are not supported within OR expressions");
+
+        Restriction restriction = relation.toRestriction(table, boundNames);
+
+        for (ColumnMetadata column : restriction.getColumnDefs())
+        {
+            if (column.isPartitionKey())
+                throw invalidRequest("Restrictions on partition key columns are not supported within OR expressions");
+
+            if (column.isClusteringColumn())
+                throw invalidRequest("Restrictions on clustering columns are not supported within OR expressions");
+        }
+
+        if (relation.operator().isAnalyzed()
+            && (!type.allowUseOfSecondaryIndices() || !restriction.hasSupportingIndex(indexRegistry)))
+        {
+            throw invalidRequest(ANALYZED_OPERATOR_REQUIRES_INDEX_MESSAGE, relation.operator(), relation);
+        }
+
+        return (SingleRestriction) restriction;
+    }
+
+    /**
+     * @return true if every leaf of every disjunction is supported by an index whose group can
+     * execute disjunctions
+     */
+    private boolean disjunctionsAreIndexSupported(IndexRegistry indexRegistry)
+    {
+        if (indexRegistry == null)
+            return false;
+
+        for (DisjunctionHolder holder : disjunctions)
+        {
+            for (SingleRestriction restriction : holder.leafRestrictions.values())
+            {
+                boolean supported = false;
+                for (Index.Group group : indexRegistry.listIndexGroups())
+                {
+                    if (group.supportsDisjunction() && !restriction.needsFiltering(group))
+                    {
+                        supported = true;
+                        break;
+                    }
+                }
+                if (!supported)
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean disjunctionsRestrictRegularColumns()
+    {
+        for (DisjunctionHolder holder : disjunctions)
+            for (SingleRestriction restriction : holder.leafRestrictions.values())
+                for (ColumnMetadata column : restriction.getColumnDefs())
+                    if (column.isRegular())
+                        return true;
+
+        return false;
+    }
+
     public void addFunctionsTo(List<Function> functions)
     {
         partitionKeyRestrictions.addFunctionsTo(functions);
         clusteringColumnsRestrictions.addFunctionsTo(functions);
         nonPrimaryKeyRestrictions.addFunctionsTo(functions);
+
+        for (DisjunctionHolder holder : disjunctions)
+            for (SingleRestriction restriction : holder.leafRestrictions.values())
+                restriction.addFunctionsTo(functions);
     }
 
     // may be used by QueryHandler implementations
@@ -418,6 +611,12 @@ public final class StatementRestrictions
                 if (!def.isPrimaryKeyColumn())
                     columns.add(def);
         }
+
+        for (DisjunctionHolder holder : disjunctions)
+            for (SingleRestriction restriction : holder.leafRestrictions.values())
+                for (ColumnMetadata def : restriction.getColumnDefs())
+                    if (!def.isPrimaryKeyColumn())
+                        columns.add(def);
 
         if (includeNotNullRestrictions)
         {
@@ -797,7 +996,7 @@ public final class StatementRestrictions
 
     public RowFilter getRowFilter(IndexRegistry indexRegistry, QueryOptions options)
     {
-        if (filterRestrictions.isEmpty())
+        if (filterRestrictions.isEmpty() && disjunctions.isEmpty())
             return RowFilter.none();
 
         // If there is only one replica, we don't need reconciliation at any consistency level.
@@ -812,7 +1011,49 @@ public final class StatementRestrictions
         for (CustomIndexExpression expression : filterRestrictions.getCustomIndexExpressions())
             expression.addToRowFilter(filter, table, options);
 
+        // Each disjunction becomes an OR child of the root. This is a structural mapping of the
+        // WHERE clause subtree, one AST node to one filter node, with no operator rewriting.
+        for (DisjunctionHolder holder : disjunctions)
+            filter.root().addChild(toFilterElement(holder.element, holder.leafRestrictions, indexRegistry, options));
+
         return filter;
+    }
+
+    private RowFilter.FilterElement toFilterElement(WhereClause.ContainerElement container,
+                                                    Map<WhereClause.RelationElement, SingleRestriction> leafRestrictions,
+                                                    IndexRegistry indexRegistry,
+                                                    QueryOptions options)
+    {
+        boolean isDisjunction = container instanceof WhereClause.OrElement;
+        RowFilter.FilterElement node = new RowFilter.FilterElement(isDisjunction, new ArrayList<>(), new ArrayList<>());
+        for (WhereClause.ExpressionElement child : container.children())
+        {
+            if (child instanceof WhereClause.ContainerElement)
+            {
+                node.addChild(toFilterElement((WhereClause.ContainerElement) child, leafRestrictions, indexRegistry, options));
+                continue;
+            }
+
+            SingleRestriction restriction = leafRestrictions.get(child);
+            RowFilter scratch = RowFilter.create(false);
+            restriction.addToRowFilter(scratch, indexRegistry, options);
+            List<RowFilter.Expression> expressions = scratch.root().expressions();
+
+            // A leaf producing several expressions, like a two bound slice or a multi target
+            // CONTAINS, keeps them conjoined in their own AND branch node under a disjunction
+            if (isDisjunction && expressions.size() > 1)
+            {
+                RowFilter.FilterElement branch = node.addAndChild();
+                for (RowFilter.Expression expression : expressions)
+                    branch.add(expression);
+            }
+            else
+            {
+                for (RowFilter.Expression expression : expressions)
+                    node.add(expression);
+            }
+        }
+        return node;
     }
 
     /**
@@ -995,6 +1236,9 @@ public final class StatementRestrictions
      */
     public boolean needFiltering(TableMetadata table)
     {
+        if (disjunctionsNeedFiltering)
+            return true;
+
         IndexRegistry indexRegistry = IndexRegistry.obtain(table);
         if (filterRestrictions.needsFiltering(indexRegistry))
             return true;
@@ -1074,5 +1318,23 @@ public final class StatementRestrictions
         return Guardrails.allowFilteringEnabled.isEnabled(state)
                ? REQUIRES_ALLOW_FILTERING_MESSAGE
                : CANNOT_USE_ALLOW_FILTERING_MESSAGE;
+    }
+
+    /**
+     * One OR subtree of the WHERE clause, with the restriction prepared for each of its relation
+     * leaves. Leaves are identified by element identity because two leaves may be structurally
+     * equal, like {@code a = 1 OR a = 1}.
+     */
+    private static final class DisjunctionHolder
+    {
+        private final WhereClause.OrElement element;
+        private final Map<WhereClause.RelationElement, SingleRestriction> leafRestrictions;
+
+        private DisjunctionHolder(WhereClause.OrElement element,
+                                  Map<WhereClause.RelationElement, SingleRestriction> leafRestrictions)
+        {
+            this.element = element;
+            this.leafRestrictions = leafRestrictions;
+        }
     }
 }
