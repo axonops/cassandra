@@ -233,6 +233,8 @@ public class GuardrailsConfigCommandsTest extends CQLTester
     "partition_keys_in_select_threshold        [-1, -1]      \n" +
     "partition_size_threshold                  [null, null]  \n" +
     "partition_tombstones_threshold            [-1, -1]      \n" +
+    "sai_analyzed_size_threshold               [8MiB, 1MiB]  \n" +
+    "sai_analyzed_tokens_threshold             [-1, -1]      \n" +
     "sai_frozen_term_size_threshold            [8KiB, 1KiB]  \n" +
     "sai_sstable_indexes_per_query_threshold   [-1, 32]      \n" +
     "sai_string_term_size_threshold            [8KiB, 1KiB]  \n" +
@@ -276,6 +278,10 @@ public class GuardrailsConfigCommandsTest extends CQLTester
     "partition_size_warn_threshold                null \n" +
     "partition_tombstones_fail_threshold          -1   \n" +
     "partition_tombstones_warn_threshold          -1   \n" +
+    "sai_analyzed_size_fail_threshold             8MiB \n" +
+    "sai_analyzed_size_warn_threshold             1MiB \n" +
+    "sai_analyzed_tokens_fail_threshold           -1   \n" +
+    "sai_analyzed_tokens_warn_threshold           -1   \n" +
     "sai_frozen_term_size_fail_threshold          8KiB \n" +
     "sai_frozen_term_size_warn_threshold          1KiB \n" +
     "sai_sstable_indexes_per_query_fail_threshold -1   \n" +
