@@ -20,6 +20,8 @@ package org.apache.cassandra.index.sai.disk.v1;
 
 import java.io.IOException;
 
+import javax.annotation.Nullable;
+
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.io.IndexFileUtils;
 import org.apache.lucene.index.CorruptIndexException;
@@ -76,6 +78,34 @@ public class SAICodecUtils
         }
     }
 
+    /**
+     * Checks the header of a per-index file. A file written under the index's own version, such as
+     * {@link Version#AB} for an analyzed index, is accepted even though {@link Version#parse} rejects
+     * that version. Any version {@link Version#parse} accepts also passes. With a null version this is
+     * {@link #checkHeader(DataInput)}.
+     */
+    public static void checkHeader(DataInput in, @Nullable Version indexVersion) throws IOException
+    {
+        if (indexVersion == null)
+        {
+            checkHeader(in);
+            return;
+        }
+
+        final int actualMagic = readBEInt(in);
+        if (actualMagic != CODEC_MAGIC)
+        {
+            throw new CorruptIndexException("codec header mismatch: actual header=" + actualMagic + " vs expected header=" + CODEC_MAGIC, in);
+        }
+        final String actualVersion = in.readString();
+        if (indexVersion.toString().equals(actualVersion))
+            return;
+        if (!Version.parse(actualVersion).onOrAfter(Version.EARLIEST))
+        {
+            throw new IOException("Unsupported version: " + actualVersion);
+        }
+    }
+
     public static void checkFooter(ChecksumIndexInput in) throws IOException
     {
         validateFooter(in, false);
@@ -91,6 +121,15 @@ public class SAICodecUtils
     public static void validate(IndexInput input) throws IOException
     {
         checkHeader(input);
+        validateFooterAndResetPosition(input);
+    }
+
+    /**
+     * Same as {@link #validate(IndexInput)}, with the header checked by {@link #checkHeader(DataInput, Version)}.
+     */
+    public static void validate(IndexInput input, @Nullable Version indexVersion) throws IOException
+    {
+        checkHeader(input, indexVersion);
         validateFooterAndResetPosition(input);
     }
 

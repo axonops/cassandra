@@ -332,7 +332,7 @@ public class V1OnDiskFormat implements OnDiskFormat
             if (checksum)
                 SAICodecUtils.validateChecksum(input);
             else
-                SAICodecUtils.validate(input);
+                SAICodecUtils.validate(input, indexContext == null ? null : indexContext.version);
         }
         catch (Exception e)
         {

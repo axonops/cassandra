@@ -45,13 +45,13 @@ public class Version implements Comparable<Version>
     // Current version
     public static final Version AA = new Version("aa", V1OnDiskFormat.instance, (c, i) -> defaultFileNameFormat(c, i, "aa"));
     // Version written only by indexes with an index_analyzer option. Everything else keeps writing AA.
+    // AB is not in ALL, so parse rejects it. Only the per-index header checks in SAICodecUtils accept it.
     public static final Version AB = new Version("ab", V2OnDiskFormat.instance, (c, i) -> defaultFileNameFormat(c, i, "ab"));
 
     // These should be added in reverse order so that the latest version is used first. Version matching tests
     // are more likely to match the latest version, so we want to test that one first.
     public static final SortedSet<Version> ALL = new TreeSet<>(Comparator.reverseOrder()) {{
         add(AA);
-        add(AB);
     }};
 
     public static final Version EARLIEST = AA;

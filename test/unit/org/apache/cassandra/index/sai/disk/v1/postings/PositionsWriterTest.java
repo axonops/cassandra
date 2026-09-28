@@ -25,6 +25,7 @@ import org.junit.Test;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.disk.format.IndexComponent;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
+import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.io.SeekingRandomAccessInput;
 import org.apache.cassandra.index.sai.disk.v1.SAICodecUtils;
 import org.apache.cassandra.index.sai.utils.IndexIdentifier;
@@ -93,7 +94,7 @@ public class PositionsWriterTest extends SAIRandomizedTester
 
         try (IndexInput input = indexDescriptor.openPerIndexInput(IndexComponent.POSITIONS, indexIdentifier))
         {
-            SAICodecUtils.validate(input);
+            SAICodecUtils.validate(input, Version.AB);
             SAICodecUtils.validateChecksum(input);
 
             for (int term = 0; term < numTerms; term++)
@@ -117,7 +118,7 @@ public class PositionsWriterTest extends SAIRandomizedTester
 
         try (IndexInput input = indexDescriptor.openPerIndexInput(IndexComponent.POSITIONS, indexIdentifier))
         {
-            SAICodecUtils.validate(input);
+            SAICodecUtils.validate(input, Version.AB);
             verifyTerm(input, summaryOffset, new int[][]{ { 42 } });
         }
     }

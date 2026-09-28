@@ -32,6 +32,7 @@ import org.apache.cassandra.index.sai.postings.PostingList;
 import org.apache.cassandra.index.sai.postings.PostingListWithPositions;
 import org.apache.cassandra.index.sai.disk.format.IndexComponent;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
+import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.metrics.QueryEventListener;
 import org.apache.cassandra.index.sai.disk.ArrayPostingList;
 import org.apache.cassandra.index.sai.disk.v1.SAICodecUtils;
@@ -228,7 +229,7 @@ public class PostingsTest extends SAIRandomizedTester
         assertTrue(analyzedLength > plainLength);
 
         IndexInput input = analyzedDescriptor.openPerIndexInput(IndexComponent.POSTING_LISTS, analyzedIdentifier);
-        SAICodecUtils.validate(input);
+        SAICodecUtils.validate(input, Version.AB);
         input.seek(postingPointer);
 
         final PostingsReader.BlocksSummary summary = new PostingsReader.BlocksSummary(input, input.getFilePointer());

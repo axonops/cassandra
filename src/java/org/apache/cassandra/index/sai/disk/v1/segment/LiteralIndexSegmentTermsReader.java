@@ -80,7 +80,7 @@ public class LiteralIndexSegmentTermsReader implements Closeable
 
         try (final IndexInput indexInput = IndexFileUtils.instance.openInput(postingsFile))
         {
-            validate(indexInput);
+            validate(indexInput, indexIdentifier.version);
         }
     }
 
