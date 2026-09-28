@@ -1111,6 +1111,8 @@ public class Message<T>
                     serializedSize40 = serializer.serializedSize(this, VERSION_40);
                 return serializedSize40;
             case VERSION_50:
+            // VERSION_AXON_50 is wire-identical to VERSION_50, so it shares the cached size
+            case MessagingService.VERSION_AXON_50:
                 if (serializedSize50 == 0)
                     serializedSize50 = serializer.serializedSize(this, VERSION_50);
                 return serializedSize50;
@@ -1131,6 +1133,8 @@ public class Message<T>
                     payloadSize40 = serializer.payloadSize(this, VERSION_40);
                 return payloadSize40;
             case VERSION_50:
+            // VERSION_AXON_50 is wire-identical to VERSION_50, so it shares the cached size
+            case MessagingService.VERSION_AXON_50:
                 if (payloadSize50 < 0)
                     payloadSize50 = serializer.payloadSize(this, VERSION_50);
                 return payloadSize50;

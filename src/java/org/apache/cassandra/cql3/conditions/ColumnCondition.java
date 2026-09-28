@@ -829,6 +829,9 @@ public abstract class ColumnCondition
             if (receiver.type instanceof CounterColumnType)
                 throw invalidRequest("Conditions on counters are not supported");
 
+            if (operator.isAnalyzed())
+                throw invalidRequest("The %s operator is not supported in conditions. Conditions always compare raw column values", operator);
+
             if (collectionElement != null)
             {
                 if (!(receiver.type.isCollection()))

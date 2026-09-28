@@ -57,7 +57,6 @@ public class SnapshotTest extends SAITester
                                        "WITH OPTIONS = { 'index_analyzer' : 'standard' }");
         waitForTableIndexesQueryable();
 
-        // single lowercase token values keep '=' behaving identically on the analyzed index
         execute("INSERT INTO %s (id1, v2) VALUES ('0', '0');");
         flush();
 
@@ -68,7 +67,7 @@ public class SnapshotTest extends SAITester
         waitForAssert(this::verifyNoIndexFiles);
 
         restoreSnapshot(snapshot);
-        assertNumRows(1, "SELECT * FROM %%s WHERE v2='0'");
+        assertNumRows(1, "SELECT * FROM %%s WHERE v2 : '0'");
 
         // the version ab components, positions included, travel with the snapshot
         StorageAttachedIndex index = (StorageAttachedIndex) getCurrentColumnFamilyStore().indexManager.getIndexByName(indexName);

@@ -19,6 +19,7 @@
 package org.apache.cassandra.index.sai.plan;
 
 import java.nio.ByteBuffer;
+import java.util.List;
 import java.util.Objects;
 
 import org.apache.commons.lang3.builder.HashCodeBuilder;
@@ -28,6 +29,9 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
+import org.apache.cassandra.index.sai.analyzer.AnalyzedToken;
+import org.apache.cassandra.index.sai.analyzer.LuceneTextAnalyzer;
+import org.apache.cassandra.index.sai.analyzer.PhraseMatcher;
 import org.apache.cassandra.index.sai.utils.IndexTermType;
 
 /**
@@ -55,6 +59,15 @@ public abstract class Expression
     // process to remove values equal to the bounds.
     public boolean upperInclusive, lowerInclusive;
 
+    // The query analyzer's tokens with positions for a PHRASE expression. A phrase expression keeps
+    // its bounds null on purpose: bounds hold raw values, and pruning sstables by the raw phrase
+    // string against token-level min and max terms would wrongly skip sstables.
+    private List<AnalyzedToken> phraseTokens;
+
+    // True when the query analyzer emitted no tokens for the queried value, e.g. a stopword-only
+    // query. Such an expression consistently matches nothing.
+    private boolean matchesNothing;
+
     Expression(IndexTermType indexTermType)
     {
         this.indexTermType = indexTermType;
@@ -77,7 +90,7 @@ public abstract class Expression
 
     public enum IndexOperator
     {
-        EQ, RANGE, CONTAINS_KEY, CONTAINS_VALUE, ANN;
+        EQ, RANGE, CONTAINS_KEY, CONTAINS_VALUE, ANN, ANALYZER_MATCHES, PHRASE;
 
         public static IndexOperator valueOf(Operator operator)
         {
@@ -100,6 +113,12 @@ public abstract class Expression
 
                 case ANN:
                     return ANN;
+
+                case ANALYZER_MATCHES:
+                    return ANALYZER_MATCHES;
+
+                case PHRASE:
+                    return PHRASE;
 
                 default:
                     return null;
@@ -124,6 +143,10 @@ public abstract class Expression
     abstract boolean hasAnalyzer();
 
     abstract AbstractAnalyzer getAnalyzer();
+
+    abstract boolean hasLuceneAnalyzer();
+
+    abstract LuceneTextAnalyzer luceneIndexAnalyzer();
 
     public IndexOperator getIndexOperator()
     {
@@ -166,6 +189,7 @@ public abstract class Expression
             case EQ:
             case CONTAINS:
             case CONTAINS_KEY:
+            case ANALYZER_MATCHES:
                 lower = new Bound(value, indexTermType, true);
                 upper = lower;
                 operator = IndexOperator.valueOf(op);
@@ -213,11 +237,65 @@ public abstract class Expression
                 lower = new Bound(value, indexTermType, true);
                 upper = lower;
                 break;
+            case PHRASE:
+                // Reached only without a backing analyzed index, e.g. the index was dropped while
+                // the query ran. There is no analyzer to evaluate the phrase with, so it matches
+                // nothing. An indexed phrase expression is built with phrase() instead.
+                phrase(List.of());
+                break;
             default:
                 throw new IllegalArgumentException("Index does not support the " + op + " operator");
         }
 
         return this;
+    }
+
+    /**
+     * Makes this expression a phrase over the given query analyzer tokens. An empty token list, a
+     * stopword-only phrase, matches nothing. Bounds stay null so no sstable is pruned by term range,
+     * see {@link #phraseTokens}.
+     *
+     * @param queryTokens the phrase analyzed by the query analyzer, positions preserved
+     * @return this expression
+     */
+    public Expression phrase(List<AnalyzedToken> queryTokens)
+    {
+        operator = IndexOperator.PHRASE;
+        phraseTokens = queryTokens;
+        matchesNothing = queryTokens.isEmpty();
+        return this;
+    }
+
+    /**
+     * Makes this expression an analyzed match that the query analyzer emitted no tokens for. It
+     * keeps the raw queried value as its bounds but consistently matches nothing.
+     *
+     * @param value the raw queried value
+     * @return this expression
+     */
+    public Expression matchingNothing(ByteBuffer value)
+    {
+        add(Operator.ANALYZER_MATCHES, value);
+        matchesNothing = true;
+        return this;
+    }
+
+    /**
+     * @return the query analyzer's tokens of a PHRASE expression, with positions
+     */
+    public List<AnalyzedToken> phraseTokens()
+    {
+        assert operator == IndexOperator.PHRASE : "Only phrase expressions carry phrase tokens";
+        return phraseTokens;
+    }
+
+    /**
+     * @return true when this expression consistently matches nothing, because the query analyzer
+     * emitted no tokens for the queried value
+     */
+    public boolean matchesNothing()
+    {
+        return matchesNothing;
     }
 
     /**
@@ -235,6 +313,14 @@ public abstract class Expression
             logger.error("Value is not valid for indexed column {} with {}", indexTermType.columnName(), indexTermType.indexType());
             return false;
         }
+
+        if (matchesNothing)
+            return false;
+
+        // The phrase re-check replays the index analyzer over the stored value, keeping positions,
+        // and requires the same strict adjacency the index intersection required
+        if (operator == IndexOperator.PHRASE)
+            return hasLuceneAnalyzer() && PhraseMatcher.matches(phraseTokens, luceneIndexAnalyzer().analyze(columnValue.duplicate()));
 
         Value value = new Value(columnValue, indexTermType);
 
@@ -275,6 +361,19 @@ public abstract class Expression
 
     private boolean validateStringValue(ByteBuffer columnValue, ByteBuffer requestedValue)
     {
+        if (hasLuceneAnalyzer())
+        {
+            // Post-filtering always re-analyzes the stored value with the INDEX analyzer, never the
+            // query analyzer: it re-checks what the write path indexed, and the requested value is
+            // already a query analyzer token.
+            for (AnalyzedToken token : luceneIndexAnalyzer().analyze(columnValue.duplicate()))
+            {
+                if (termMatches(token.bytes(), requestedValue))
+                    return true;
+            }
+            return false;
+        }
+
         if (hasAnalyzer())
         {
             AbstractAnalyzer analyzer = getAnalyzer();
@@ -307,6 +406,7 @@ public abstract class Expression
             case EQ:
             case CONTAINS_KEY:
             case CONTAINS_VALUE:
+            case ANALYZER_MATCHES:
                 isMatch = indexTermType.compare(term, requestedValue) == 0;
                 break;
             case RANGE:
@@ -347,6 +447,12 @@ public abstract class Expression
     @Override
     public String toString()
     {
+        if (operator == IndexOperator.PHRASE)
+            return String.format("Expression{name: %s, op: %s, tokens: %s}",
+                                 indexTermType.columnName(),
+                                 operator,
+                                 phraseTokens);
+
         return String.format("Expression{name: %s, op: %s, lower: (%s, %s), upper: (%s, %s)}",
                              indexTermType.columnName(),
                              operator,
@@ -361,7 +467,9 @@ public abstract class Expression
     {
         return new HashCodeBuilder().append(indexTermType)
                                     .append(operator)
-                                    .append(lower).append(upper).build();
+                                    .append(lower).append(upper)
+                                    .append(phraseTokens)
+                                    .append(matchesNothing).build();
     }
 
     @Override
@@ -378,7 +486,9 @@ public abstract class Expression
         return Objects.equals(indexTermType, o.indexTermType)
                && operator == o.operator
                && Objects.equals(lower, o.lower)
-               && Objects.equals(upper, o.upper);
+               && Objects.equals(upper, o.upper)
+               && Objects.equals(phraseTokens, o.phraseTokens)
+               && matchesNothing == o.matchesNothing;
     }
 
     public static class IndexedExpression extends Expression
@@ -414,6 +524,18 @@ public abstract class Expression
         {
             return index.analyzer();
         }
+
+        @Override
+        boolean hasLuceneAnalyzer()
+        {
+            return index.hasLuceneAnalyzer();
+        }
+
+        @Override
+        LuceneTextAnalyzer luceneIndexAnalyzer()
+        {
+            return index.luceneIndexAnalyzer();
+        }
     }
 
     public static class UnindexedExpression extends Expression
@@ -443,6 +565,18 @@ public abstract class Expression
 
         @Override
         AbstractAnalyzer getAnalyzer()
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        boolean hasLuceneAnalyzer()
+        {
+            return false;
+        }
+
+        @Override
+        LuceneTextAnalyzer luceneIndexAnalyzer()
         {
             throw new UnsupportedOperationException();
         }

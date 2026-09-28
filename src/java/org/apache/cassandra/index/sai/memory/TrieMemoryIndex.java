@@ -26,6 +26,7 @@ import java.util.Map;
 import java.util.NavigableMap;
 import java.util.PriorityQueue;
 import java.util.SortedSet;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
@@ -47,6 +48,7 @@ import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
 import org.apache.cassandra.index.sai.analyzer.AnalyzedToken;
 import org.apache.cassandra.index.sai.analyzer.LuceneTextAnalyzer;
+import org.apache.cassandra.index.sai.analyzer.PhraseMatcher;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.v1.segment.SegmentMetadata;
 import org.apache.cassandra.index.sai.disk.v1.vector.PrimaryKeyWithScore;
@@ -56,6 +58,7 @@ import org.apache.cassandra.index.sai.utils.IndexIdentifier;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.index.sai.utils.PrimaryKeys;
 import org.apache.cassandra.index.sai.utils.PrimaryKeysWithPositions;
+import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.CloseableIterator;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
@@ -237,12 +240,18 @@ public class TrieMemoryIndex extends MemoryIndex
         if (logger.isTraceEnabled())
             logger.trace("Searching memtable index on expression '{}'...", expression);
 
+        if (expression.matchesNothing())
+            return KeyRangeIterator.empty();
+
         switch (expression.getIndexOperator())
         {
             case EQ:
             case CONTAINS_KEY:
             case CONTAINS_VALUE:
+            case ANALYZER_MATCHES:
                 return exactMatch(expression, keyRange);
+            case PHRASE:
+                return phraseMatch(expression, keyRange);
             case RANGE:
                 KeyRangeIterator keyIterator = rangeMatch(expression, keyRange);
                 int keyCount = (int) keyIterator.getMaxKeys();
@@ -374,6 +383,79 @@ public class TrieMemoryIndex extends MemoryIndex
         PrimaryKeys primaryKeys = data.get(comparableMatch);
         return primaryKeys == null ? KeyRangeIterator.empty()
                                    : new FilteringInMemoryKeyRangeIterator(primaryKeys.keys(), keyRange);
+    }
+
+    /**
+     * Intersects the phrase's per-token position maps on primary keys and keeps the keys whose
+     * newest row version holds the tokens with strictly matching position gaps. Stale trie entries
+     * of older row versions are skipped by requiring one shared epoch, and any surviving false
+     * candidate is removed by the re-analyzing post-filter.
+     */
+    private KeyRangeIterator phraseMatch(Expression expression, AbstractBounds<PartitionPosition> keyRange)
+    {
+        List<AnalyzedToken> queryTokens = expression.phraseTokens();
+
+        // One map lookup per distinct token, repeated tokens share the entry
+        Map<ByteBuffer, PrimaryKeysWithPositions> perToken = new LinkedHashMap<>();
+        for (AnalyzedToken token : queryTokens)
+        {
+            ByteBuffer tokenBytes = token.bytes();
+            if (perToken.containsKey(tokenBytes))
+                continue;
+
+            PrimaryKeys primaryKeys = data.get(asComparableBytes(tokenBytes));
+            if (primaryKeys == null || primaryKeys.isEmpty())
+                return KeyRangeIterator.empty();
+
+            perToken.put(tokenBytes, (PrimaryKeysWithPositions) primaryKeys);
+        }
+
+        PrimaryKeysWithPositions smallest = null;
+        for (PrimaryKeysWithPositions candidate : perToken.values())
+        {
+            if (smallest == null || candidate.size() < smallest.size())
+                smallest = candidate;
+        }
+
+        int[] queryPositions = new int[queryTokens.size()];
+        int[][] positionsPerOccurrence = new int[queryTokens.size()][];
+
+        int candidates = 0;
+        TreeSet<PrimaryKey> matches = new TreeSet<>();
+        for (PrimaryKey candidate : smallest.keys())
+        {
+            long epoch = smallest.entry(candidate).epoch();
+            boolean allTokensPresent = true;
+            int occurrence = 0;
+            for (AnalyzedToken token : queryTokens)
+            {
+                // The newest version of the row wrote all its tokens under one epoch, so an entry
+                // with a different epoch belongs to an older, overwritten row version
+                PrimaryKeysWithPositions.PositionEntry entry = perToken.get(token.bytes()).entry(candidate);
+                if (entry == null || entry.epoch() != epoch)
+                {
+                    allTokensPresent = false;
+                    break;
+                }
+                queryPositions[occurrence] = token.position();
+                positionsPerOccurrence[occurrence] = entry.positions();
+                occurrence++;
+            }
+
+            if (!allTokensPresent)
+                continue;
+
+            candidates++;
+            if (PhraseMatcher.matches(queryPositions, positionsPerOccurrence))
+                matches.add(candidate);
+        }
+
+        if (Tracing.isTracing())
+            Tracing.trace("Phrase intersection on memtable index matched {} of {} candidates for {} tokens",
+                          matches.size(), candidates, queryTokens.size());
+
+        return matches.isEmpty() ? KeyRangeIterator.empty()
+                                 : new FilteringInMemoryKeyRangeIterator(matches, keyRange);
     }
 
     @Override

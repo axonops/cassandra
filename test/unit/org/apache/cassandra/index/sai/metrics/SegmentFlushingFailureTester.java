@@ -187,7 +187,7 @@ public abstract class SegmentFlushingFailureTester extends SAITester
         verifyCompactionIndexBuilds(1, segmentFlushFailure, currentTable());
 
         // We should still be able to query the index if compaction is aborted:
-        ResultSet rows = executeNet("SELECT * FROM %s WHERE v2 = '0'");
+        ResultSet rows = executeNet("SELECT * FROM %s WHERE v2 : '0'");
         assertEquals(1, rows.all().size());
     }
 

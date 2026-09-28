@@ -74,6 +74,7 @@ import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.index.sai.utils.RangeUtil;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.AbstractIterator;
 import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.CloseableIterator;
@@ -521,6 +522,8 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         public void close()
         {
             FileUtils.closeQuietly(resultKeyIterator);
+            if (Tracing.isTracing())
+                Tracing.trace("Index post-filter matched {} of {} rows", queryContext.rowsMatched, queryContext.rowsFiltered);
             if (tableQueryMetrics != null) tableQueryMetrics.record(queryContext);
         }
     }
@@ -542,6 +545,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
 
                 if (tree.isSatisfiedBy(partitionKey, (Row) unfiltered, staticRow))
                 {
+                    context.rowsMatched++;
                     matches.add(unfiltered);
                     hasMatch = true;
                 }
@@ -560,6 +564,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
 
             if (tree.isSatisfiedBy(partitionKey, staticRow, staticRow))
             {
+                context.rowsMatched++;
                 hasMatch = true;
             }
         }
@@ -843,6 +848,9 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             public void close()
             {
                 response.close();
+                if (Tracing.isTracing())
+                    Tracing.trace("Replica filtering protection post-filter matched {} of {} rows",
+                                  context.rowsMatched, context.rowsFiltered);
             }
 
             @Override
@@ -909,7 +917,10 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                             Row row = delegate.next();
                             context.rowsFiltered++;
                             if (tree.isSatisfiedBy(delegate.partitionKey(), row, staticRow))
+                            {
+                                context.rowsMatched++;
                                 return row;
+                            }
                         }
                         return null;
                     }

@@ -421,6 +421,50 @@ public interface Index
     public boolean supportsExpression(ColumnMetadata column, Operator operator);
 
     /**
+     * An analysis view over an index whose column values are transformed by an analyzer before
+     * indexing. Row filter evaluation of the analyzed operators, {@code :} and {@code PHRASE},
+     * cannot compare raw bytes, so it consults this surface to re-analyze the stored value instead.
+     * The coordinator uses this during replica filtering protection re-checks. The analyzer is
+     * always re-derived from schema, never serialized.
+     */
+    interface Analyzer
+    {
+        /**
+         * The {@code :} operator semantics: analyzes the query value with the query analyzer and
+         * the stored value with the index analyzer.
+         *
+         * @return true when every query token appears among the stored value's tokens
+         */
+        boolean matches(ByteBuffer storedValue, ByteBuffer queryValue);
+
+        /**
+         * The {@code PHRASE} operator semantics: analyzes both sides keeping positions and requires
+         * strictly adjacent, gap-preserving positions.
+         *
+         * @return true when the stored value contains the phrase
+         */
+        boolean matchesPhrase(ByteBuffer storedValue, ByteBuffer phraseValue);
+
+        /**
+         * @return true when the index rewrites {@code =} restrictions on its column to analyzed
+         * matches, i.e. its {@code equals_behaviour_when_analyzed} option is {@code MATCH}
+         */
+        boolean rewritesEquals();
+    }
+
+    /**
+     * Returns the analysis view of this index over the given column, empty unless this index
+     * analyzes that column's values.
+     *
+     * @param column the target column of a search query predicate
+     * @return the index's {@link Analyzer} for the column, empty when the index does not analyze it
+     */
+    default Optional<Analyzer> analyzerFor(ColumnMetadata column)
+    {
+        return Optional.empty();
+    }
+
+    /**
      * Returns whether this index does any kind of filtering when the query has multiple contains expressions, assuming
      * that each of those expressions are supported as defined by {@link #supportsExpression(ColumnMetadata, Operator)}.
      *

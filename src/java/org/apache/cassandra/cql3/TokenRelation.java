@@ -119,6 +119,12 @@ public final class TokenRelation extends Relation
     }
 
     @Override
+    protected Restriction newAnalyzerMatchesRestriction(TableMetadata table, VariableSpecifications boundNames, Operator operator)
+    {
+        throw invalidRequest("%s cannot be used with the token function", operator);
+    }
+
+    @Override
     protected Term toTerm(List<? extends ColumnSpecification> receivers,
                           Raw raw,
                           String keyspace,

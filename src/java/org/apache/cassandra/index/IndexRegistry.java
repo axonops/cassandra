@@ -318,6 +318,26 @@ public interface IndexRegistry
     Optional<Index> getBestIndexFor(RowFilter.Expression expression);
 
     /**
+     * Returns the analysis view of the first registered index that analyzes the given column, empty
+     * when no registered index does. Used to evaluate the analyzed operators, {@code :} and
+     * {@code PHRASE}, in row filters, and to apply the {@code equals_behaviour_when_analyzed}
+     * option to {@code =} restrictions.
+     *
+     * @param column the target column of a search query predicate
+     * @return an {@link Index.Analyzer} for the column, empty when no index analyzes it
+     */
+    default Optional<Index.Analyzer> analyzerFor(ColumnMetadata column)
+    {
+        for (Index index : listIndexes())
+        {
+            Optional<Index.Analyzer> analyzer = index.analyzerFor(column);
+            if (analyzer.isPresent())
+                return analyzer;
+        }
+        return Optional.empty();
+    }
+
+    /**
      * Called at write time to ensure that values present in the update
      * are valid according to the rules of all registered indexes which
      * will process it. The partition key as well as the clustering and

@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.function.BiFunction;
@@ -41,10 +42,12 @@ import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.QueryContext;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
+import org.apache.cassandra.index.sai.analyzer.AnalyzedToken;
 import org.apache.cassandra.index.sai.disk.v1.vector.PrimaryKeyWithScore;
 import org.apache.cassandra.index.sai.iterators.KeyRangeIterator;
 import org.apache.cassandra.index.sai.utils.IndexTermType;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.CloseableIterator;
 
 public class Operation
@@ -186,7 +189,38 @@ public class Operation
 
     private static void buildIndexedExpression(StorageAttachedIndex index, RowFilter.Expression expression, List<Expression> perColumn)
     {
-        if (index.hasAnalyzer())
+        if (index.hasLuceneAnalyzer() && expression.operator() == Operator.PHRASE)
+        {
+            List<AnalyzedToken> tokens = index.luceneQueryAnalyzer().analyze(expression.getIndexValue().duplicate());
+            traceQueryTokens(index, expression, tokens);
+            perColumn.add(Expression.create(index).phrase(tokens));
+        }
+        else if (index.hasLuceneAnalyzer() && (expression.operator() == Operator.ANALYZER_MATCHES
+                                               || index.termType().isMultiExpression(expression)))
+        {
+            // One Expression per distinct query analyzer token, AND semantics downstream. This shape
+            // must never fold tokens into one EQ range, whose bounds overwrite each other.
+            List<AnalyzedToken> tokens = index.luceneQueryAnalyzer().analyze(expression.getIndexValue().duplicate());
+            traceQueryTokens(index, expression, tokens);
+
+            Set<ByteBuffer> distinctTokens = new LinkedHashSet<>();
+            for (AnalyzedToken token : tokens)
+                distinctTokens.add(token.bytes());
+
+            if (distinctTokens.isEmpty())
+            {
+                // A query the analyzer emits no tokens for, e.g. only stopwords, matches nothing
+                perColumn.add(Expression.create(index).matchingNothing(expression.getIndexValue().duplicate()));
+            }
+            else
+            {
+                Operator operator = expression.operator() == Operator.EQ ? Operator.ANALYZER_MATCHES
+                                                                         : expression.operator();
+                for (ByteBuffer token : distinctTokens)
+                    perColumn.add(Expression.create(index).add(operator, token.duplicate()));
+            }
+        }
+        else if (index.hasAnalyzer())
         {
             AbstractAnalyzer analyzer = index.analyzer();
             try
@@ -257,6 +291,25 @@ public class Operation
                 range.add(expression.operator(), expression.getIndexValue().duplicate());
             }
         }
+    }
+
+    /**
+     * Traces how the query analyzer tokenized the queried value, one event per analyzed expression.
+     */
+    private static void traceQueryTokens(StorageAttachedIndex index, RowFilter.Expression expression, List<AnalyzedToken> tokens)
+    {
+        if (!Tracing.isTracing())
+            return;
+
+        StringBuilder builder = new StringBuilder();
+        for (AnalyzedToken token : tokens)
+        {
+            if (builder.length() > 0)
+                builder.append(", ");
+            builder.append(index.termType().asString(token.bytes())).append('@').append(token.position());
+        }
+        Tracing.trace("Query analyzed {} {} value into {} tokens with positions: [{}]",
+                      expression.column().name, expression.operator(), tokens.size(), builder);
     }
 
     /**

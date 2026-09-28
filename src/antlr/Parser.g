@@ -1768,11 +1768,13 @@ relationType returns [Operator op]
     | '>'  { $op = Operator.GT; }
     | '>=' { $op = Operator.GTE; }
     | '!=' { $op = Operator.NEQ; }
+    | ':'  { $op = Operator.ANALYZER_MATCHES; }
     ;
 
 relation[WhereClause.Builder clauses]
     : name=cident type=relationType t=term { $clauses.add(new SingleColumnRelation(name, type, t)); }
     | name=cident K_LIKE t=term { $clauses.add(new SingleColumnRelation(name, Operator.LIKE, t)); }
+    | name=cident K_PHRASE t=term { $clauses.add(new SingleColumnRelation(name, Operator.PHRASE, t)); }
     | name=cident K_IS K_NOT K_NULL { $clauses.add(new SingleColumnRelation(name, Operator.IS_NOT, Constants.NULL_LITERAL)); }
     | K_TOKEN l=tupleOfIdentifiers type=relationType t=term
         { $clauses.add(new TokenRelation(l, type, t)); }
@@ -2021,5 +2023,6 @@ basic_unreserved_keyword returns [String str]
         | K_SELECT_MASKED
         | K_VECTOR
         | K_ANN
+        | K_PHRASE
         ) { $str = $k.text; }
     ;

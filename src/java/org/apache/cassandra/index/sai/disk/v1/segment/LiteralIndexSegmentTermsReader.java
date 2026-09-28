@@ -97,6 +97,21 @@ public class LiteralIndexSegmentTermsReader implements Closeable
         return new TermQuery(term, perQueryEventListener, context).execute();
     }
 
+    /**
+     * Looks one term up in the terms dictionary without opening its postings.
+     *
+     * @return the file offset of the term's postings summary, or
+     * {@link PostingList#OFFSET_NOT_FOUND} when the segment does not contain the term
+     */
+    public long postingsOffset(ByteComparable term)
+    {
+        try (TrieTermsDictionaryReader reader = new TrieTermsDictionaryReader(termDictionaryFile.instantiateRebufferer(null), termDictionaryRoot))
+        {
+            long offset = reader.exactMatch(term);
+            return offset == TrieTermsDictionaryReader.NOT_FOUND ? PostingList.OFFSET_NOT_FOUND : offset;
+        }
+    }
+
     @VisibleForTesting
     public class TermQuery
     {

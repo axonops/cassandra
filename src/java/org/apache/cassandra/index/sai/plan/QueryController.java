@@ -179,7 +179,7 @@ public class QueryController
     public boolean hasAnalyzer(RowFilter.Expression expression)
     {
         StorageAttachedIndex index = indexFor(expression);
-        return index != null && index.hasAnalyzer();
+        return index != null && (index.hasAnalyzer() || index.hasLuceneAnalyzer());
     }
 
     public UnfilteredRowIterator queryStorage(List<PrimaryKey> keys, ReadExecutionController executionController)

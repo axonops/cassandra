@@ -36,9 +36,8 @@ bounds the set of available analyzers, tokenizers and filters.
 The analyzer core parses and validates the value space of the `index_analyzer` and
 `query_analyzer` index options. The value is either a built-in analyzer name (matched
 case insensitively) or a JSON object describing a custom analyzer. You can validate a
-config and preview its tokenization today with the `sai_analyze` function described
-below. Creating an index with these options is not wired up yet, it arrives with the
-index write and read path phases.
+config and preview its tokenization with the `sai_analyze` function described below,
+and create analyzed indexes as described under "Analyzed indexes".
 
 ### Built-in analyzer names
 
@@ -127,12 +126,101 @@ not indexed, a counter is incremented and a rate limited log line names the colu
 key. The cumulative size bound exists because analyzers such as ngram can produce far
 more indexed bytes than the input value contains.
 
+## Analyzed indexes
+
+CREATE INDEX accepts the `index_analyzer` and `query_analyzer` options on SAI indexes over
+text columns, including non-frozen collections of text. An analyzed index tokenizes every
+value it indexes and stores token positions, so it can answer the match and phrase
+operators below. Values written to an analyzed index are indexed per token, with the
+guardrails above applied per value.
+
+    CREATE CUSTOM INDEX ON ks.articles(body) USING 'sai'
+      WITH OPTIONS = { 'index_analyzer': 'english' };
+
+`query_analyzer` defaults to `index_analyzer` when absent. Analysis options are rejected
+on primary key columns and on non-text columns.
+
+## The `:` match operator
+
+`column : 'value'` matches rows whose analyzed column contains every token the query
+analyzer emits for the value. Multiple tokens are combined with AND semantics:
+
+    SELECT * FROM ks.articles WHERE body : 'quick fox';
+
+matches rows whose body contains a token `quick` and a token `fox`, in any order and any
+distance apart. A value the query analyzer emits no tokens for, for example one consisting
+only of stopwords, consistently matches nothing.
+
+On a non-frozen collection of text, `:` matches per element like an analyzed CONTAINS:
+each token may come from any element. CONTAINS itself also analyzes its value on analyzed
+collection indexes, with the same AND-of-tokens semantics.
+
+`:` requires a storage-attached index with an `index_analyzer` on the column. It is not
+allowed in UPDATE or DELETE WHERE clauses or in LWT IF conditions; conditions always
+compare raw column values.
+
+## The `PHRASE` operator
+
+`column PHRASE 'value'` matches rows whose analyzed column contains the value's tokens at
+strictly adjacent positions:
+
+    SELECT * FROM ks.articles WHERE body PHRASE 'quick fox';
+
+Adjacency is gap preserving, zero based, with Lucene `PhraseQuery` slop 0 semantics. If
+the analyzer removes stopwords but preserves position gaps, `'quick fox'` does not match
+a stored `'quick the fox'` (indexed as `quick@0, fox@2`), while the query `'quick the
+fox'` does. Users who want stopwords to be invisible configure an analyzer that compacts
+position increments. A phrase whose analysis emits no tokens matches nothing.
+
+On non-frozen collections each element has its own position space, so a phrase never
+matches across element boundaries.
+
+Phrase candidates are intersected inside each index segment on the stored positions, and
+every returned row is re-checked by re-analyzing the stored value, on the replica and,
+for reads that reconcile multiple replicas, again on the coordinator.
+
+## `=` on analyzed columns
+
+The `equals_behaviour_when_analyzed` index option decides what `=` means on a column with
+an `index_analyzer`:
+
+| Option value | Behaviour of `=` on the analyzed column |
+|---|---|
+| `UNSUPPORTED` (default) | The query is rejected with an error suggesting the `:` operator |
+| `MATCH` | `=` behaves exactly like `:`, and the client receives a warning |
+
+LWT IF conditions are unaffected: they always compare raw bytes, so under `MATCH` a
+SELECT with `=` and an IF condition with `=` can disagree by design.
+
+## Cluster upgrade rule
+
+The `:` and `PHRASE` operators, and `=` under `MATCH` behaviour, are refused with an
+InvalidRequest error until every node in the cluster runs this build. Nodes advertise a
+fork messaging version and the coordinator checks that all live peers speak it before
+accepting one of these queries. During a rolling upgrade the queries fail fast with a
+message naming a node that has not been upgraded, instead of returning wrong results
+from a node that cannot evaluate them.
+
+A node only advertises the fork version when its `storage_compatibility_mode` is
+not `CASSANDRA_4` (that is, `UPGRADING` or `NONE`). Clusters still running with
+`CASSANDRA_4` compatibility, the 5.0 default in
+`cassandra.yaml`, keep the analyzed operators gated off until the mode is lifted,
+exactly like other 5.0-level features.
+
+## Tracing
+
+With tracing enabled these queries emit events at each decision point:
+
+* how the query analyzer tokenized the queried value, tokens with positions
+* per segment phrase intersection statistics, candidates in and matches out, for both
+  memtable and sstable segments
+* post-filter counts, rows matched of rows checked, on replicas and on the coordinator
+  during replica filtering protection
+
 ## Not yet available
 
 Coming in later commits on this branch:
 
-* the `:` match operator and the `PHRASE` operator
 * `OR` in queries against analyzed indexes
 * BM25 relevance scoring and `ORDER BY`
-* `index_analyzer` and `query_analyzer` accepted by CREATE INDEX
 * metrics for dropped values, oversize tokens and analyzer config errors

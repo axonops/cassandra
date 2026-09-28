@@ -43,7 +43,6 @@ public class NodeRestartTest extends SAITester
         IndexIdentifier indexIdentifier =
             createIndexIdentifier(createIndex("CREATE INDEX IF NOT EXISTS ON %s(v2) USING 'sai' " +
                                               "WITH OPTIONS = { 'index_analyzer' : 'standard' }"));
-        // single lowercase token values keep '=' behaving identically on the analyzed index
         execute("INSERT INTO %s (id1, v2) VALUES ('0', '0')");
         flush();
 
@@ -51,7 +50,7 @@ public class NodeRestartTest extends SAITester
         simulateNodeRestart();
 
         verifySSTableIndexes(indexIdentifier, 1);
-        assertNumRows(1, "SELECT * FROM %%s WHERE v2='0'");
+        assertNumRows(1, "SELECT * FROM %%s WHERE v2 : '0'");
     }
 
     // Failure during the pre-join and initialization tasks shouldn't fail node restart.

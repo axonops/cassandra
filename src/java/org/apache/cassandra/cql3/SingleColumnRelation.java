@@ -264,6 +264,18 @@ public final class SingleColumnRelation extends Relation
         return new SingleColumnRestriction.LikeRestriction(columnDef, operator, term);
     }
 
+    @Override
+    protected Restriction newAnalyzerMatchesRestriction(TableMetadata table, VariableSpecifications boundNames, Operator operator)
+    {
+        if (mapKey != null)
+            throw invalidRequest("%s can't be used with map elements.", operator);
+
+        ColumnMetadata columnDef = table.getExistingColumn(entity);
+        Term term = toTerm(toReceivers(columnDef), value, table.keyspace, boundNames);
+
+        return new SingleColumnRestriction.AnalyzerMatchesRestriction(columnDef, operator, term);
+    }
+
     /**
      * Returns the receivers for this relation.
      * @param columnDef the column definition
@@ -304,6 +316,11 @@ public final class SingleColumnRelation extends Relation
             {
                 receiver = makeCollectionReceiver(receiver, isContainsKey());
             }
+            else if (relationType.isAnalyzed() && receiver.type.isMultiCell())
+            {
+                // The analyzed operators match individual collection elements, like CONTAINS
+                receiver = makeCollectionReceiver(receiver, false);
+            }
             else if (receiver.type.isMultiCell() && mapKey != null && isEQ())
             {
                 List<ColumnSpecification> receivers = new ArrayList<>(2);
@@ -323,7 +340,7 @@ public final class SingleColumnRelation extends Relation
 
     private boolean isLegalRelationForNonFrozenCollection()
     {
-        return isContainsKey() || isContains() || isMapEntryEquality();
+        return isContainsKey() || isContains() || isMapEntryEquality() || relationType.isAnalyzed();
     }
 
     private boolean isMapEntryEquality()

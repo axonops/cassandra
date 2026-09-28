@@ -219,7 +219,12 @@ public class MessagingService extends MessagingServiceMBeanImpl implements Messa
         VERSION_3014(11),
         VERSION_40(12),
         // c14227 TTL overflow, 'uint' timestamps
-        VERSION_50(13);
+        VERSION_50(13),
+        // Fork version for the SAI full-text query features. Wire formats are identical to VERSION_50
+        // until a feature serializer forks. The version exists so peers running this build can be told
+        // apart from vanilla 5.0 peers. The value is far above the apache range so future upstream
+        // versions (14, 15, ...) never collide with fork semantics.
+        VERSION_AXON_50(100);
 
         public final int value;
 
@@ -249,12 +254,14 @@ public class MessagingService extends MessagingServiceMBeanImpl implements Messa
     public static final int VERSION_3014 = 11;
     public static final int VERSION_40 = 12;
     public static final int VERSION_50 = 13; // c14227 TTL overflow, 'uint' timestamps
+    // Fork version for the SAI full-text query features, wire-identical to VERSION_50 (see the Version enum)
+    public static final int VERSION_AXON_50 = 100;
     public static final int minimum_version = VERSION_40;
-    public static final int maximum_version = VERSION_50;
+    public static final int maximum_version = VERSION_AXON_50;
     // we want to use a modified behavior for the tools and clients - that is, since they are not running a server, they
     // should not need to run in a compatibility mode. They should be able to connect to the server regardless whether
     // it uses messaving version 4 or 5
-    public static final int current_version = DatabaseDescriptor.getStorageCompatibilityMode().isBefore(5) ? VERSION_40 : VERSION_50;
+    public static final int current_version = DatabaseDescriptor.getStorageCompatibilityMode().isBefore(5) ? VERSION_40 : VERSION_AXON_50;
     static AcceptVersions accept_messaging;
     static AcceptVersions accept_streaming;
     static

@@ -92,7 +92,7 @@ public class SAICodecUtilsTest extends SAIRandomizedTester
         {
             assertThatThrownBy(() -> SAICodecUtils.checkHeader(input))
             .isInstanceOf(IllegalArgumentException.class)
-            .hasMessageContaining("The version string zz does not represent a valid SAI version. It should be one of aa");
+            .hasMessageContaining("The version string zz does not represent a valid SAI version. It should be one of ab, aa");
         }
     }
 

@@ -332,6 +332,8 @@ public class Mutation implements IMutation, Supplier<Mutation>
                     serializedSize40 = (int) serializer.serializedSize(this, VERSION_40);
                 return serializedSize40;
             case VERSION_50:
+            // VERSION_AXON_50 is wire-identical to VERSION_50, so it shares the cached size
+            case MessagingService.VERSION_AXON_50:
                 if (serializedSize50 == 0)
                     serializedSize50 = (int) serializer.serializedSize(this, VERSION_50);
                 return serializedSize50;

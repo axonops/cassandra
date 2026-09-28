@@ -24,6 +24,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -88,6 +89,7 @@ import org.apache.cassandra.index.sai.analyzer.AnalyzerConfig;
 import org.apache.cassandra.index.sai.analyzer.EqualsBehaviourWhenAnalyzed;
 import org.apache.cassandra.index.sai.analyzer.LuceneTextAnalyzer;
 import org.apache.cassandra.index.sai.analyzer.NonTokenizingOptions;
+import org.apache.cassandra.index.sai.analyzer.PhraseMatcher;
 import org.apache.cassandra.index.sai.disk.SSTableIndex;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.format.Version;
@@ -187,6 +189,7 @@ public class StorageAttachedIndex implements Index
     @Nullable private final AbstractAnalyzer.AnalyzerFactory analyzerFactory;
     @Nullable private final LuceneTextAnalyzer luceneIndexAnalyzer;
     @Nullable private final LuceneTextAnalyzer luceneQueryAnalyzer;
+    @Nullable private final Index.Analyzer analysisView;
     @Nullable private final AnalyzedTermLimits analyzedTermLimits;
     private final EqualsBehaviourWhenAnalyzed equalsBehaviourWhenAnalyzed;
     private final PrimaryKey.Factory primaryKeyFactory;
@@ -225,6 +228,7 @@ public class StorageAttachedIndex implements Index
                                                         : new LuceneTextAnalyzer(analyzerConfigs.queryConfig, indexTermType);
         analyzedTermLimits = analyzerConfigs == null ? null : new AnalyzedTermLimits(indexIdentifier, indexTermType);
         equalsBehaviourWhenAnalyzed = EqualsBehaviourWhenAnalyzed.fromOptions(indexMetadata.options);
+        analysisView = luceneIndexAnalyzer == null ? null : new AnalysisView();
         memtableIndexManager = new MemtableIndexManager(this);
         indexMetrics = new IndexMetrics(this, memtableIndexManager);
         maxTermSizeGuardrail = indexTermType.isVector()
@@ -478,7 +482,19 @@ public class StorageAttachedIndex implements Index
     @Override
     public boolean supportsExpression(ColumnMetadata column, Operator operator)
     {
+        if (operator.isAnalyzed())
+            return dependsOn(column) && hasLuceneAnalyzer() && indexTermType.isLiteral();
+
         return dependsOn(column) && indexTermType.supports(operator);
+    }
+
+    @Override
+    public Optional<Index.Analyzer> analyzerFor(ColumnMetadata column)
+    {
+        if (analysisView == null || !dependsOn(column))
+            return Optional.empty();
+
+        return Optional.of(analysisView);
     }
 
     @Override
@@ -1051,6 +1067,85 @@ public class StorageAttachedIndex implements Index
         }
 
         return nonIndexed;
+    }
+
+    /**
+     * The {@link Index.Analyzer} surface of an analyzed index. Row filter evaluation calls
+     * {@link #matches} or {@link #matchesPhrase} once per candidate row with the same query value,
+     * so the query side analysis is memoized. The stored side is re-analyzed per row with the index
+     * analyzer, never the query analyzer, matching what the write path indexed.
+     */
+    private class AnalysisView implements Index.Analyzer
+    {
+        // One-entry memo of the last analyzed query value. Volatile keeps concurrent queries
+        // correct, and a miss only costs one extra analysis.
+        private volatile QueryTokens lastQueryTokens;
+
+        @Override
+        public boolean matches(ByteBuffer storedValue, ByteBuffer queryValue)
+        {
+            List<AnalyzedToken> queryTokens = queryTokens(queryValue);
+            if (queryTokens.isEmpty())
+                return false;
+
+            List<AnalyzedToken> storedTokens = luceneIndexAnalyzer.analyze(storedValue.duplicate());
+            if (storedTokens.isEmpty())
+                return false;
+
+            Set<ByteBuffer> stored = new HashSet<>(storedTokens.size());
+            for (AnalyzedToken token : storedTokens)
+                stored.add(token.bytes());
+
+            for (AnalyzedToken token : queryTokens)
+            {
+                if (!stored.contains(token.bytes()))
+                    return false;
+            }
+            return true;
+        }
+
+        @Override
+        public boolean matchesPhrase(ByteBuffer storedValue, ByteBuffer phraseValue)
+        {
+            List<AnalyzedToken> queryTokens = queryTokens(phraseValue);
+            if (queryTokens.isEmpty())
+                return false;
+
+            return PhraseMatcher.matches(queryTokens, luceneIndexAnalyzer.analyze(storedValue.duplicate()));
+        }
+
+        @Override
+        public boolean rewritesEquals()
+        {
+            return equalsBehaviourWhenAnalyzed == EqualsBehaviourWhenAnalyzed.MATCH;
+        }
+
+        private List<AnalyzedToken> queryTokens(ByteBuffer queryValue)
+        {
+            QueryTokens memo = lastQueryTokens;
+            if (memo != null && memo.value.equals(queryValue))
+                return memo.tokens;
+
+            ByteBuffer value = queryValue.duplicate();
+            List<AnalyzedToken> tokens = luceneQueryAnalyzer.analyze(value);
+            lastQueryTokens = new QueryTokens(value, tokens);
+            return tokens;
+        }
+    }
+
+    /**
+     * One analyzed query value and its tokens, the memo entry of {@link AnalysisView}
+     */
+    private static class QueryTokens
+    {
+        final ByteBuffer value;
+        final List<AnalyzedToken> tokens;
+
+        QueryTokens(ByteBuffer value, List<AnalyzedToken> tokens)
+        {
+            this.value = value;
+            this.tokens = tokens;
+        }
     }
 
     private class UpdateIndexer implements Index.Indexer

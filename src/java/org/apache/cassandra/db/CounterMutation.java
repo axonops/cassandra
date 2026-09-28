@@ -50,6 +50,7 @@ import org.apache.cassandra.utils.btree.BTreeSet;
 import static java.util.concurrent.TimeUnit.*;
 import static org.apache.cassandra.net.MessagingService.VERSION_40;
 import static org.apache.cassandra.net.MessagingService.VERSION_50;
+import static org.apache.cassandra.net.MessagingService.VERSION_AXON_50;
 import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 public class CounterMutation implements IMutation
@@ -342,6 +343,8 @@ public class CounterMutation implements IMutation
                     serializedSize40 = (int) serializer.serializedSize(this, VERSION_40);
                 return serializedSize40;
             case VERSION_50:
+            // VERSION_AXON_50 is wire-identical to VERSION_50, so it shares the cached size
+            case VERSION_AXON_50:
                 if (serializedSize50 == 0)
                     serializedSize50 = (int) serializer.serializedSize(this, VERSION_50);
                 return serializedSize50;

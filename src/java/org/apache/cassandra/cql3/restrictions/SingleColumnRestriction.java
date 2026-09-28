@@ -32,6 +32,9 @@ import org.apache.cassandra.db.MultiCBuilder;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexRegistry;
+import org.apache.cassandra.index.sai.ClusterVersionGate;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
 
@@ -154,6 +157,15 @@ public abstract class SingleColumnRestriction implements SingleRestriction
 
     public static final class EQRestriction extends SingleColumnRestriction
     {
+        public static final String EQ_UNSUPPORTED_ON_ANALYZED_MESSAGE =
+            "Column '%s' has an analyzed index and its equals_behaviour_when_analyzed is UNSUPPORTED, " +
+            "so = cannot be used on it. Use the : operator, or recreate the index with " +
+            "equals_behaviour_when_analyzed MATCH";
+
+        public static final String EQ_MATCH_WARNING =
+            "Column '%s' has an analyzed index with equals_behaviour_when_analyzed MATCH, so = behaves " +
+            "like the : operator on it";
+
         private final Term value;
 
         public EQRestriction(ColumnMetadata columnDef, Term value)
@@ -185,6 +197,21 @@ public abstract class SingleColumnRestriction implements SingleRestriction
                                    IndexRegistry indexRegistry,
                                    QueryOptions options)
         {
+            Index.Analyzer analyzer = indexRegistry == null ? null
+                                                            : indexRegistry.analyzerFor(columnDef).orElse(null);
+            if (analyzer != null)
+            {
+                // The column's index analyzes values, so raw equality would compare bytes the index
+                // never stored. The equals_behaviour_when_analyzed option decides what = means here.
+                if (!analyzer.rewritesEquals())
+                    throw invalidRequest(EQ_UNSUPPORTED_ON_ANALYZED_MESSAGE, columnDef.name);
+
+                ClusterVersionGate.checkClusterSupports("= on an analyzed column");
+                ClientWarn.instance.warn(String.format(EQ_MATCH_WARNING, columnDef.name));
+                filter.add(columnDef, Operator.ANALYZER_MATCHES, value.bindAndGet(options));
+                return;
+            }
+
             filter.add(columnDef, Operator.EQ, value.bindAndGet(options));
         }
 
@@ -824,6 +851,88 @@ public abstract class SingleColumnRestriction implements SingleRestriction
             return Pair.create(operator, newValue);
         }
     }
+
+    /**
+     * Restriction for the analyzed operators, {@code :} and {@code PHRASE}. Both need a
+     * storage-attached index with an {@code index_analyzer} on the column, and both are gated on
+     * every node in the cluster running this build, because a vanilla replica cannot evaluate them.
+     */
+    public static final class AnalyzerMatchesRestriction extends SingleColumnRestriction
+    {
+        private final Operator operator;
+        private final Term value;
+
+        public AnalyzerMatchesRestriction(ColumnMetadata columnDef, Operator operator, Term value)
+        {
+            super(columnDef);
+            this.operator = operator;
+            this.value = value;
+        }
+
+        @Override
+        public void addFunctionsTo(List<Function> functions)
+        {
+            value.addFunctionsTo(functions);
+        }
+
+        @Override
+        public boolean isEQ()
+        {
+            return false;
+        }
+
+        @Override
+        public boolean canBeConvertedToMultiColumnRestriction()
+        {
+            return false;
+        }
+
+        @Override
+        MultiColumnRestriction toMultiColumnRestriction()
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void addToRowFilter(RowFilter filter,
+                                   IndexRegistry indexRegistry,
+                                   QueryOptions options)
+        {
+            ClusterVersionGate.checkClusterSupports("The " + operator + " operator");
+
+            RowFilter.SimpleExpression expression = filter.add(columnDef, operator, value.bindAndGet(options));
+            indexRegistry.getBestIndexFor(expression)
+                         .orElseThrow(() -> invalidRequest("%s is only supported on columns indexed with an index_analyzer",
+                                                           expression));
+        }
+
+        @Override
+        public MultiCBuilder appendTo(MultiCBuilder builder, QueryOptions options)
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public String toString()
+        {
+            return operator.toString();
+        }
+
+        @Override
+        public SingleRestriction doMergeWith(SingleRestriction otherRestriction)
+        {
+            throw invalidRequest("%s cannot be restricted by more than one relation if it includes a %s", columnDef.name, operator);
+        }
+
+        @Override
+        protected boolean isSupportedBy(Index index)
+        {
+            // Only a storage-attached index can support the analyzed operators. Older index
+            // implementations have operator switches that predate them, so they are not asked.
+            return index instanceof StorageAttachedIndex && index.supportsExpression(columnDef, operator);
+        }
+    }
+
     public static final class AnnRestriction extends SingleColumnRestriction
     {
         private final Term value;

@@ -24,10 +24,12 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import javax.annotation.Nullable;
 
 import com.google.common.base.Objects;
 
@@ -65,6 +67,7 @@ import org.apache.cassandra.db.rows.RowIterator;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexRegistry;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
@@ -739,6 +742,10 @@ public class RowFilter implements Iterable<RowFilter.Expression>
      */
     public static class SimpleExpression extends Expression
     {
+        // Lazily resolved analysis view of the index backing an analyzed operator, cached across the
+        // rows of one query. Always re-derived from schema through the registry, never serialized.
+        private Optional<Index.Analyzer> analyzer;
+
         SimpleExpression(ColumnMetadata column, Operator operator, ByteBuffer value)
         {
             super(column, operator, value);
@@ -790,6 +797,40 @@ public class RowFilter implements Iterable<RowFilter.Expression>
                         ByteBuffer foundValue = getValue(metadata, partitionKey, row, nowInSec);
                         // Note that CQL expression are always of the form 'x < 4', i.e. the tested value is on the left.
                         return foundValue != null && operator.isSatisfiedBy(column.type, foundValue, value);
+                    }
+                case ANALYZER_MATCHES:
+                case PHRASE:
+                    {
+                        // Re-analyzes the stored value with the index analyzer, since raw byte
+                        // comparison cannot evaluate the analyzed operators. This also runs on the
+                        // coordinator during replica filtering protection re-checks, so merged rows
+                        // get the same analysis the replicas applied.
+                        Index.Analyzer indexAnalyzer = analyzer(metadata);
+                        if (indexAnalyzer == null)
+                            // The analyzed index was dropped mid-query. Without its analyzer the
+                            // operator cannot match anything.
+                            return false;
+
+                        if (column.isComplex())
+                        {
+                            ComplexColumnData complexData = row.getComplexColumnData(column);
+                            if (complexData == null)
+                                return false;
+
+                            // Each collection element is analyzed on its own, so a phrase never
+                            // matches across element boundaries.
+                            boolean elementIsCellPath = column.type instanceof SetType;
+                            for (Cell<?> cell : complexData)
+                            {
+                                ByteBuffer element = elementIsCellPath ? cell.path().get(0) : cell.buffer();
+                                if (analyzedMatch(indexAnalyzer, element))
+                                    return true;
+                            }
+                            return false;
+                        }
+
+                        ByteBuffer foundValue = getValue(metadata, partitionKey, row, nowInSec);
+                        return foundValue != null && analyzedMatch(indexAnalyzer, foundValue);
                     }
                 case CONTAINS:
                     assert column.type.isCollection();
@@ -851,6 +892,21 @@ public class RowFilter implements Iterable<RowFilter.Expression>
             throw new AssertionError();
         }
 
+        private boolean analyzedMatch(Index.Analyzer indexAnalyzer, ByteBuffer storedValue)
+        {
+            return operator == Operator.PHRASE ? indexAnalyzer.matchesPhrase(storedValue, value)
+                                               : indexAnalyzer.matches(storedValue, value);
+        }
+
+        @Nullable
+        private Index.Analyzer analyzer(TableMetadata metadata)
+        {
+            // Benign race: concurrent first calls both resolve the same registry entry
+            if (analyzer == null)
+                analyzer = IndexRegistry.obtain(metadata).analyzerFor(column);
+            return analyzer.orElse(null);
+        }
+
         @Override
         protected String toString(boolean cql)
         {
@@ -868,6 +924,15 @@ public class RowFilter implements Iterable<RowFilter.Expression>
                     break;
                 case IN:
                     type = ListType.getInstance(type, false);
+                    break;
+                case ANALYZER_MATCHES:
+                case PHRASE:
+                    // On collections the analyzed operators compare elements, so the value is an element
+                    if (type.isCollection() && type.isMultiCell())
+                    {
+                        CollectionType<?> collection = (CollectionType<?>) type;
+                        type = collection.kind == CollectionType.Kind.SET ? collection.nameComparator() : collection.valueComparator();
+                    }
                     break;
                 default:
                     break;

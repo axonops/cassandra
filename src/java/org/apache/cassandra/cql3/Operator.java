@@ -275,6 +275,38 @@ public enum Operator
             // needs to return true so that the returned values are allowed through to the VectorTopKProcessor
             return true;
         }
+    },
+    ANALYZER_MATCHES(16)
+    {
+        @Override
+        public String toString()
+        {
+            return ":";
+        }
+
+        @Override
+        public boolean isSatisfiedBy(AbstractType<?> type, ByteBuffer leftOperand, ByteBuffer rightOperand)
+        {
+            // Evaluation needs the index analyzer, which raw bytes cannot provide. RowFilter evaluates
+            // this operator through the Index.Analyzer surface instead of calling this method.
+            throw new UnsupportedOperationException();
+        }
+    },
+    PHRASE(17)
+    {
+        @Override
+        public String toString()
+        {
+            return "PHRASE";
+        }
+
+        @Override
+        public boolean isSatisfiedBy(AbstractType<?> type, ByteBuffer leftOperand, ByteBuffer rightOperand)
+        {
+            // Evaluation needs the index analyzer, which raw bytes cannot provide. RowFilter evaluates
+            // this operator through the Index.Analyzer surface instead of calling this method.
+            throw new UnsupportedOperationException();
+        }
     };
 
     /**
@@ -374,5 +406,15 @@ public enum Operator
     public boolean isContainsKey()
     {
         return this == CONTAINS_KEY;
+    }
+
+    /**
+     * Checks if this operator is evaluated through an index analyzer, i.e. the analyzed match
+     * operator {@code :} or the {@code PHRASE} operator.
+     * @return {@code true} if this operator needs an index analyzer, {@code false} otherwise.
+     */
+    public boolean isAnalyzed()
+    {
+        return this == ANALYZER_MATCHES || this == PHRASE;
     }
 }

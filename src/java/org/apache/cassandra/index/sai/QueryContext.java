@@ -49,6 +49,7 @@ public class QueryContext
     public long segmentsHit = 0;
     public long partitionsRead = 0;
     public long rowsFiltered = 0;
+    public long rowsMatched = 0;
 
     public long trieSegmentsHit = 0;
     public long triePostingsSkips = 0;

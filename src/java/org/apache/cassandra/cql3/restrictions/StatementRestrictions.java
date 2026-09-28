@@ -77,6 +77,9 @@ public final class StatementRestrictions
 
     public static final String ANN_REQUIRES_INDEXED_FILTERING_MESSAGE = "ANN ordering by vector requires all restricted column(s) to be indexed";
 
+    public static final String ANALYZED_OPERATOR_REQUIRES_INDEX_MESSAGE =
+            "%s is only supported on columns with a storage-attached index using an index_analyzer. %s is not valid.";
+
     /**
      * The type of statement
      */
@@ -191,7 +194,8 @@ public final class StatementRestrictions
          */
         for (Relation relation : whereClause.relations)
         {
-            if ((relation.isContains() || relation.isContainsKey()) && (type.isUpdate() || type.isDelete()))
+            if ((relation.isContains() || relation.isContainsKey() || relation.operator().isAnalyzed())
+                && (type.isUpdate() || type.isDelete()))
             {
                 throw invalidRequest("Cannot use %s with %s", type, relation.operator());
             }
@@ -211,6 +215,16 @@ public final class StatementRestrictions
                     throw new InvalidRequestException(String.format("LIKE restriction is only supported on properly " +
                                                                     "indexed columns. %s is not valid.",
                                                                     relation));
+
+                addRestriction(restriction, indexRegistry);
+            }
+            else if (relation.operator().isAnalyzed())
+            {
+                Restriction restriction = relation.toRestriction(table, boundNames);
+
+                if (!type.allowUseOfSecondaryIndices() || !restriction.hasSupportingIndex(indexRegistry))
+                    throw new InvalidRequestException(String.format(ANALYZED_OPERATOR_REQUIRES_INDEX_MESSAGE,
+                                                                    relation.operator(), relation));
 
                 addRestriction(restriction, indexRegistry);
             }
