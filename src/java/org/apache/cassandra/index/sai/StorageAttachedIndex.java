@@ -485,6 +485,11 @@ public class StorageAttachedIndex implements Index
         if (operator.isAnalyzed())
             return dependsOn(column) && hasLuceneAnalyzer() && indexTermType.isLiteral();
 
+        // An index_analyzer index holds words, not whole elements or keys. EQ stays supported
+        // because equals_behaviour_when_analyzed may rewrite it to MATCH.
+        if (hasLuceneAnalyzer() && (operator == Operator.CONTAINS || operator == Operator.CONTAINS_KEY))
+            return false;
+
         return dependsOn(column) && indexTermType.supports(operator);
     }
 

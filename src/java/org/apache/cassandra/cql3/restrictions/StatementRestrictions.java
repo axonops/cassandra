@@ -42,6 +42,7 @@ import org.apache.cassandra.dht.*;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexRegistry;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ClientState;
@@ -79,6 +80,12 @@ public final class StatementRestrictions
 
     public static final String ANALYZED_OPERATOR_REQUIRES_INDEX_MESSAGE =
             "%s is only supported on columns with a storage-attached index using an index_analyzer. %s is not valid.";
+
+    public static final String ANALYZED_CONTAINS_MESSAGE =
+            "Column '%s' has an analyzed index: CONTAINS compares whole elements, use MATCH or PHRASE for word search.";
+
+    public static final String ANALYZED_CONTAINS_KEY_MESSAGE =
+            "Column '%s' has an analyzed index on its keys: CONTAINS KEY compares whole keys. Word search over map keys is not available.";
 
     /**
      * The type of statement
@@ -267,6 +274,7 @@ public final class StatementRestrictions
             }
             else
             {
+                checkContainsIsNotAnalyzed(relation, indexRegistry);
                 addRestriction(relation.toRestriction(table, boundNames), indexRegistry);
             }
         }
@@ -501,6 +509,37 @@ public final class StatementRestrictions
         }
     }
 
+    /**
+     * Refuses CONTAINS and CONTAINS KEY when every index that serves the relation's target has an
+     * index_analyzer. Such an index holds words, not whole elements or keys, so it cannot answer these
+     * operators. When any other index serves the target, that index answers them and nothing is refused.
+     */
+    private void checkContainsIsNotAnalyzed(Relation relation, IndexRegistry indexRegistry)
+    {
+        if (indexRegistry == null || !(relation.isContains() || relation.isContainsKey()))
+            return;
+
+        ColumnMetadata column = table.getExistingColumn(((SingleColumnRelation) relation).getEntity());
+        Operator operator = relation.operator();
+        boolean servedByAnalyzedIndex = false;
+        for (Index index : indexRegistry.listIndexes())
+        {
+            if (index instanceof StorageAttachedIndex && ((StorageAttachedIndex) index).hasLuceneAnalyzer())
+            {
+                StorageAttachedIndex analyzed = (StorageAttachedIndex) index;
+                if (analyzed.dependsOn(column) && analyzed.termType().supports(operator))
+                    servedByAnalyzedIndex = true;
+            }
+            else if (index.supportsExpression(column, operator))
+            {
+                return;
+            }
+        }
+
+        if (servedByAnalyzedIndex)
+            throw invalidRequest(relation.isContains() ? ANALYZED_CONTAINS_MESSAGE : ANALYZED_CONTAINS_KEY_MESSAGE, column.name);
+    }
+
     private SingleRestriction prepareDisjunctionLeaf(Relation relation,
                                                      VariableSpecifications boundNames,
                                                      IndexRegistry indexRegistry)
@@ -530,6 +569,8 @@ public final class StatementRestrictions
             if (column.isClusteringColumn())
                 throw invalidRequest("Restrictions on clustering columns are not supported within OR expressions");
         }
+
+        checkContainsIsNotAnalyzed(relation, indexRegistry);
 
         if (relation.operator().isAnalyzed()
             && (!type.allowUseOfSecondaryIndices() || !restriction.hasSupportingIndex(indexRegistry)))

@@ -220,7 +220,7 @@ public class AnalyzedTermLimitsIntegrationTest extends SAITester
 
         // the memtable indexes the first MAX_ELEMENTS_PER_ROW values and drops the rest, counted
         assertEquals(excess, index.analyzedTermLimits().droppedValueCount());
-        assertEquals(1, execute("SELECT * FROM %s WHERE val CONTAINS 'e0'").size());
+        assertEquals(1, execute("SELECT * FROM %s WHERE val MATCH 'e0'").size());
 
         flush();
         assertEquals(excess, index.analyzedTermLimits().droppedValueCount());
@@ -228,7 +228,7 @@ public class AnalyzedTermLimitsIntegrationTest extends SAITester
         compact();
         waitForCompactionsFinished();
         assertEquals(2L * excess, index.analyzedTermLimits().droppedValueCount());
-        assertEquals(1, execute("SELECT * FROM %s WHERE val CONTAINS 'e0'").size());
+        assertEquals(1, execute("SELECT * FROM %s WHERE val MATCH 'e0'").size());
     }
 
     private Set<String> elements(int count)

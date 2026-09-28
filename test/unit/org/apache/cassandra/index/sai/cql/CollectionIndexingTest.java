@@ -207,17 +207,17 @@ public class CollectionIndexingTest extends SAITester
     @Test
     public void indexAnalyzedSetPreAndPostFlush()
     {
-        // single lowercase token elements keep CONTAINS behaving identically on the analyzed index
+        // MATCH finds each single word element before and after flush
         createTable("CREATE TABLE %s (pk int primary key, value set<text>)");
         createIndex("CREATE INDEX ON %s(value) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
         execute("INSERT INTO %s (pk, value) VALUES (1, {'apple', 'pie'})");
         execute("INSERT INTO %s (pk, value) VALUES (2, {'banana'})");
 
-        assertEquals(1, execute("SELECT * FROM %s WHERE value CONTAINS 'apple'").size());
-        assertEquals(1, execute("SELECT * FROM %s WHERE value CONTAINS 'banana'").size());
+        assertEquals(1, execute("SELECT * FROM %s WHERE value MATCH 'apple'").size());
+        assertEquals(1, execute("SELECT * FROM %s WHERE value MATCH 'banana'").size());
         flush();
-        assertEquals(1, execute("SELECT * FROM %s WHERE value CONTAINS 'apple'").size());
-        assertEquals(1, execute("SELECT * FROM %s WHERE value CONTAINS 'banana'").size());
+        assertEquals(1, execute("SELECT * FROM %s WHERE value MATCH 'apple'").size());
+        assertEquals(1, execute("SELECT * FROM %s WHERE value MATCH 'banana'").size());
     }
 
     @Test
@@ -229,11 +229,73 @@ public class CollectionIndexingTest extends SAITester
         // the partial update is its own mutation, the earlier element must stay queryable
         execute("UPDATE %s SET value = value + {'pie'} WHERE pk = 1");
 
-        assertEquals(1, execute("SELECT * FROM %s WHERE value CONTAINS 'apple'").size());
-        assertEquals(1, execute("SELECT * FROM %s WHERE value CONTAINS 'pie'").size());
+        assertEquals(1, execute("SELECT * FROM %s WHERE value MATCH 'apple'").size());
+        assertEquals(1, execute("SELECT * FROM %s WHERE value MATCH 'pie'").size());
         flush();
-        assertEquals(1, execute("SELECT * FROM %s WHERE value CONTAINS 'apple'").size());
-        assertEquals(1, execute("SELECT * FROM %s WHERE value CONTAINS 'pie'").size());
+        assertEquals(1, execute("SELECT * FROM %s WHERE value MATCH 'apple'").size());
+        assertEquals(1, execute("SELECT * FROM %s WHERE value MATCH 'pie'").size());
+    }
+
+    @Test
+    public void containsIsRefusedWhenOnlyAnalyzedIndexesServeTheTarget() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int primary key, value set<text>, m map<text, text>, v int)");
+        createIndex("CREATE INDEX ON %s(value) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        createIndex("CREATE INDEX ON %s(VALUES(m)) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        createIndex("CREATE INDEX ON %s(KEYS(m)) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(v) USING 'sai'");
+        execute("INSERT INTO %s (pk, value, m, v) VALUES (1, {'quick brown fox'}, {'colour': 'dark red'}, 1)");
+
+        String valueRefused = String.format(StatementRestrictions.ANALYZED_CONTAINS_MESSAGE, "value");
+        assertInvalidMessage(valueRefused, "SELECT pk FROM %s WHERE value CONTAINS 'quick brown fox'");
+        assertInvalidMessage(valueRefused, "SELECT pk FROM %s WHERE value CONTAINS 'quick' ALLOW FILTERING");
+        assertInvalidMessage(valueRefused, "SELECT pk FROM %s WHERE value CONTAINS 'quick' OR v = 1");
+        assertInvalidMessage(String.format(StatementRestrictions.ANALYZED_CONTAINS_MESSAGE, "m"),
+                             "SELECT pk FROM %s WHERE m CONTAINS 'dark red'");
+
+        // the plain KEYS index answers CONTAINS KEY next to the analyzed VALUES index
+        assertRows(execute("SELECT pk FROM %s WHERE m CONTAINS KEY 'colour'"), row(1));
+        assertRows(execute("SELECT pk FROM %s WHERE value MATCH 'quick'"), row(1));
+    }
+
+    @Test
+    public void containsKeyIsRefusedOnAnalyzedKeysIndex() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int primary key, m map<text, text>)");
+        createIndex("CREATE INDEX ON %s(KEYS(m)) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        execute("INSERT INTO %s (pk, m) VALUES (1, {'colour': 'dark red'})");
+
+        assertInvalidMessage(String.format(StatementRestrictions.ANALYZED_CONTAINS_KEY_MESSAGE, "m"),
+                             "SELECT pk FROM %s WHERE m CONTAINS KEY 'colour'");
+    }
+
+    @Test
+    public void legacyIndexAnswersContainsNextToAnalyzedIndex() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int primary key, value set<text>)");
+        createIndex("CREATE INDEX ON %s(value) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        createIndex("CREATE INDEX ON %s(value) USING 'legacy_local_table'");
+        execute("INSERT INTO %s (pk, value) VALUES (1, {'quick brown fox'})");
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk FROM %s WHERE value CONTAINS 'quick brown fox'"), row(1));
+            assertEmpty(execute("SELECT pk FROM %s WHERE value CONTAINS 'quick'"));
+            assertRows(execute("SELECT pk FROM %s WHERE value MATCH 'quick'"), row(1));
+        });
+    }
+
+    @Test
+    public void nonTokenizingSetIndexKeepsContains() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int primary key, value set<text>)");
+        createIndex("CREATE INDEX ON %s(value) USING 'sai' WITH OPTIONS = { 'case_sensitive' : false }");
+        execute("INSERT INTO %s (pk, value) VALUES (1, {'Apple Pie'})");
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk FROM %s WHERE value CONTAINS 'apple pie'"), row(1));
+            assertRows(execute("SELECT pk FROM %s WHERE value CONTAINS 'Apple Pie'"), row(1));
+            assertEmpty(execute("SELECT pk FROM %s WHERE value CONTAINS 'apple'"));
+        });
     }
 
     private void createPopulatedMap(String createIndex)

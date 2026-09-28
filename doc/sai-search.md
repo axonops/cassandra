@@ -151,9 +151,16 @@ matches rows whose body contains a token `quick` and a token `fox`, in any order
 distance apart. A value the query analyzer emits no tokens for, for example one consisting
 only of stopwords, consistently matches nothing.
 
-On a non-frozen collection of text, `MATCH` matches per element like an analyzed CONTAINS:
-each token may come from any element. CONTAINS itself also analyzes its value on analyzed
-collection indexes, with the same AND-of-tokens semantics.
+On a non-frozen collection of text, `MATCH` searches the words of every element: each
+token may come from any element.
+
+CONTAINS and CONTAINS KEY always compare whole elements and whole keys. An index with an
+`index_analyzer` holds words, so it cannot answer them. When every index on the target is
+analyzed, they are refused with or without ALLOW FILTERING. CONTAINS is refused with an
+error that points to `MATCH` or `PHRASE`. CONTAINS KEY is refused with an error saying
+word search over map keys is not available. When another index covers the same target,
+for example a plain storage-attached index or a legacy secondary index, that index answers
+CONTAINS and CONTAINS KEY as usual.
 
 `MATCH` requires a storage-attached index with an `index_analyzer` on the column. It is
 not allowed in UPDATE or DELETE WHERE clauses. LWT IF conditions never take `MATCH` or

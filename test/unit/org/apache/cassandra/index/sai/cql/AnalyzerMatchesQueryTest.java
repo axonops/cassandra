@@ -21,10 +21,18 @@ import org.junit.Before;
 import org.junit.Test;
 
 import com.datastax.driver.core.Session;
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.index.sai.SAITester;
+import org.apache.cassandra.schema.ColumnMetadata;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -161,7 +169,7 @@ public class AnalyzerMatchesQueryTest extends SAITester
     }
 
     @Test
-    public void containsIsAnalyzedOnCollections() throws Throwable
+    public void containsIsRefusedOnAnalyzedCollections() throws Throwable
     {
         createTable("CREATE TABLE %s (id int PRIMARY KEY, val set<text>)");
         createIndex("CREATE INDEX ON %s(val) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
@@ -170,10 +178,36 @@ public class AnalyzerMatchesQueryTest extends SAITester
         execute("INSERT INTO %s (id, val) VALUES (2, {'lazy brown dog'})");
 
         beforeAndAfterFlush(() -> {
-            assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE val CONTAINS 'brown'"), row(1), row(2));
-            // CONTAINS analyzes its value too: multiple tokens are an AND
-            assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE val CONTAINS 'quick fox'"), row(1));
+            String refused = String.format(StatementRestrictions.ANALYZED_CONTAINS_MESSAGE, "val");
+            assertInvalidMessage(refused, "SELECT id FROM %s WHERE val CONTAINS 'brown'");
+            assertInvalidMessage(refused, "SELECT id FROM %s WHERE val CONTAINS 'quick fox'");
+            assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE val MATCH 'quick fox'"), row(1));
         });
+    }
+
+    @Test
+    public void containsFiltersAreNotPlannedOnAnalyzedIndexes() throws Throwable
+    {
+        createTable("CREATE TABLE %s (id int PRIMARY KEY, val set<text>, m map<text, text>)");
+        createIndex("CREATE INDEX ON %s(val) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        createIndex("CREATE INDEX ON %s(KEYS(m)) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        ColumnMetadata val = cfs.metadata().getColumn(ColumnIdentifier.getInterned("val", false));
+        ColumnMetadata m = cfs.metadata().getColumn(ColumnIdentifier.getInterned("m", false));
+
+        // built directly, so the statement layer refusal is not involved
+        RowFilter contains = RowFilter.create(false);
+        contains.add(val, Operator.CONTAINS, UTF8Type.instance.decompose("quick"));
+        assertNull(cfs.indexManager.getBestIndexQueryPlanFor(contains));
+
+        RowFilter containsKey = RowFilter.create(false);
+        containsKey.add(m, Operator.CONTAINS_KEY, UTF8Type.instance.decompose("colour"));
+        assertNull(cfs.indexManager.getBestIndexQueryPlanFor(containsKey));
+
+        RowFilter match = RowFilter.create(false);
+        match.add(val, Operator.ANALYZER_MATCHES, UTF8Type.instance.decompose("quick"));
+        assertNotNull(cfs.indexManager.getBestIndexQueryPlanFor(match));
     }
 
     @Test
