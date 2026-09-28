@@ -743,7 +743,7 @@ createFunctionStatement returns [CreateFunctionStatement.Raw stmt]
       ')'
       ( (K_RETURNS K_NULL) | (K_CALLED { calledOnNullInput=true; })) K_ON K_NULL K_INPUT
       K_RETURNS returnType = comparatorType
-      K_LANGUAGE language = IDENT
+      K_LANGUAGE (language = IDENT | language = K_PHRASE)
       K_AS body = STRING_LITERAL
       { $stmt = new CreateFunctionStatement.Raw(
           fn, argNames, argTypes, returnType, calledOnNullInput, $language.text.toLowerCase(), $body.text, orReplace, ifNotExists);
@@ -1935,12 +1935,14 @@ vector_type returns [CQL3Type.Raw vt]
 
 username
     : IDENT
+    | K_PHRASE
     | STRING_LITERAL
     | QUOTED_NAME { addRecognitionError("Quoted strings are are not supported for user names and USER is deprecated, please use ROLE");}
     ;
 
 identity
     : IDENT
+    | K_PHRASE
     | STRING_LITERAL
     | QUOTED_NAME { addRecognitionError("Quoted strings are are not supported for identity");}
     ;
