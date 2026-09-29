@@ -34,6 +34,7 @@ import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.MapType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.partitions.SingletonUnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
@@ -49,6 +50,8 @@ import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.schema.Indexes;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.btree.BTree;
@@ -162,6 +165,84 @@ public class RowFilterTest
         RowFilter.Expression eq = new RowFilter.SimpleExpression(t, Operator.EQ, ByteBufferUtil.EMPTY_BYTE_BUFFER);
         filter = filter.withNewExpressions(ImmutableList.of(gt, lt, eq));
         assertTrue(filter.isMutableIntersection());
+    }
+
+    // Byte pins for these row filters at messaging versions 12 and 13.
+
+    private static TableMetadata stockPinMetadata()
+    {
+        return TableMetadata.builder("testks", "pincf")
+                            .addPartitionKeyColumn("pk", Int32Type.instance)
+                            .addClusteringColumn("ck", Int32Type.instance)
+                            .addStaticColumn("s", Int32Type.instance)
+                            .addRegularColumn("r", Int32Type.instance)
+                            .addRegularColumn("m", MapType.getInstance(UTF8Type.instance, Int32Type.instance, true))
+                            .indexes(Indexes.of(IndexMetadata.fromSchemaMetadata("pin_idx", IndexMetadata.Kind.CUSTOM, Collections.emptyMap())))
+                            .build();
+    }
+
+    private static void assertStockBytes(String expectedHex, RowFilter filter, TableMetadata metadata) throws Exception
+    {
+        for (int version : new int[]{ MessagingService.VERSION_40, MessagingService.VERSION_50 })
+        {
+            try (DataOutputBuffer out = new DataOutputBuffer())
+            {
+                RowFilter.serializer.serialize(filter, out, version);
+                assertEquals("version " + version, expectedHex, ByteBufferUtil.bytesToHex(out.asNewBuffer()));
+                assertEquals(out.getLength(), RowFilter.serializer.serializedSize(filter, version));
+            }
+
+            try (DataInputBuffer in = new DataInputBuffer(ByteBufferUtil.hexToBytes(expectedHex), false);
+                 DataOutputBuffer out = new DataOutputBuffer())
+            {
+                RowFilter read = RowFilter.serializer.deserialize(in, version, metadata, false);
+                assertEquals(0, in.available());
+                RowFilter.serializer.serialize(read, out, version);
+                assertEquals("version " + version, expectedHex, ByteBufferUtil.bytesToHex(out.asNewBuffer()));
+            }
+        }
+    }
+
+    @Test
+    public void testStockBytesEmptyFilter() throws Exception
+    {
+        assertStockBytes("0000", RowFilter.none(), stockPinMetadata());
+    }
+
+    @Test
+    public void testStockBytesEveryStockOperator() throws Exception
+    {
+        TableMetadata metadata = stockPinMetadata();
+        ColumnMetadata r = metadata.getColumn(new ColumnIdentifier("r", true));
+        Operator[] operators = { Operator.EQ, Operator.GTE, Operator.GT, Operator.LTE, Operator.LT,
+                                 Operator.CONTAINS, Operator.CONTAINS_KEY, Operator.IN, Operator.NEQ,
+                                 Operator.IS_NOT, Operator.LIKE_PREFIX, Operator.LIKE_SUFFIX,
+                                 Operator.LIKE_CONTAINS, Operator.LIKE_MATCHES, Operator.LIKE, Operator.ANN };
+
+        RowFilter filter = RowFilter.create(false);
+        for (int i = 0; i < operators.length; i++)
+            filter.add(r, operators[i], Int32Type.instance.decompose(i));
+
+        assertStockBytes("00100000017200000000000400000000000001720000000100040000000100000172000000020004000000020000017200000003000400000003000001720000000400040000000400000172000000050004000000050000017200000006000400000006000001720000000700040000000700000172000000080004000000080000017200000009000400000009000001720000000a00040000000a000001720000000b00040000000b000001720000000c00040000000c000001720000000d00040000000d000001720000000e00040000000e000001720000000f00040000000f", filter, metadata);
+    }
+
+    @Test
+    public void testStockBytesMixedExpressionKinds() throws Exception
+    {
+        TableMetadata metadata = stockPinMetadata();
+        ColumnMetadata s = metadata.getColumn(new ColumnIdentifier("s", true));
+        ColumnMetadata r = metadata.getColumn(new ColumnIdentifier("r", true));
+        ColumnMetadata m = metadata.getColumn(new ColumnIdentifier("m", true));
+
+        RowFilter filter = RowFilter.create(true);
+        filter.add(s, Operator.EQ, Int32Type.instance.decompose(1));
+        filter.addMapEquality(m, UTF8Type.instance.decompose("k"), Operator.EQ, Int32Type.instance.decompose(2));
+        filter.add(r, Operator.GT, Int32Type.instance.decompose(3));
+        filter.addCustomIndexExpression(metadata, metadata.indexes.get("pin_idx").get(), UTF8Type.instance.decompose("q"));
+        filter.add(m, Operator.CONTAINS_KEY, UTF8Type.instance.decompose("a"));
+        filter.add(m, Operator.CONTAINS, Int32Type.instance.decompose(4));
+
+        assertStockBytes("000600000173000000000004000000010100016d0000000000016b00040000000200000172000000020004000000030312d260b46616396e99560dfbf671cefb0001710000016d000000060001610000016d00000005000400000004", filter, metadata);
     }
 
     private static TableMetadata treeMetadata()

@@ -36,6 +36,10 @@ import org.junit.Test;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.statements.SelectStatement;
+import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
 import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.filter.DataLimits;
@@ -53,10 +57,12 @@ import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.DeserializationHelper;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.rows.UnfilteredRowIterators;
+import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.QueryCancelledException;
+import org.apache.cassandra.index.Index;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataOutputBuffer;
@@ -74,9 +80,11 @@ import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.SchemaTestUtil;
+import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableParams;
 import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -88,6 +96,7 @@ import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -1372,6 +1381,103 @@ public class ReadCommandTest
             }
         }
         return digests.iterator().next();
+    }
+
+    // Byte pins for the read commands of these CQL queries at messaging versions 12 and 13. The table
+    // ids and nowInSec are fixed so the bytes do not change between runs.
+
+    private static final String CQL_PINS = "cql_pins";
+    private static final String CQL_PINS_SAI = "cql_pins_sai";
+    private static final long CQL_PINS_NOW_IN_SEC = 1700000000L;
+
+    private static void createCqlPinsTables()
+    {
+        if (Schema.instance.getTableMetadata(KEYSPACE, CQL_PINS) == null)
+            QueryProcessor.executeOnceInternal(String.format("CREATE TABLE \"%s\".%s (pk int, ck int, v int, t text, s set<text>, m map<text, int>, PRIMARY KEY (pk, ck)) " +
+                                                             "WITH ID = 6f1c2a50-3e4b-11ee-9a55-2f7c6b8d9e01", KEYSPACE, CQL_PINS));
+
+        if (Schema.instance.getTableMetadata(KEYSPACE, CQL_PINS_SAI) == null)
+        {
+            // Storage-attached indexes do not support ByteOrderedPartitioner, the test default
+            SchemaTestUtil.announceNewTable(CreateTableStatement.parse(String.format("CREATE TABLE %s (pk int PRIMARY KEY, t text)", CQL_PINS_SAI), KEYSPACE)
+                                                                .id(TableId.fromString("6f1c2a50-3e4b-11ee-9a55-2f7c6b8d9e02"))
+                                                                .partitioner(Murmur3Partitioner.instance)
+                                                                .build());
+            QueryProcessor.executeOnceInternal(String.format("CREATE INDEX cql_pins_sai_t_idx ON \"%s\".%s (t) USING 'sai'", KEYSPACE, CQL_PINS_SAI));
+            ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(CQL_PINS_SAI);
+            Index index = cfs.indexManager.getIndexByName("cql_pins_sai_t_idx");
+            Util.spinAssertEquals(true, () -> cfs.indexManager.isIndexQueryable(index), 30);
+        }
+    }
+
+    private static List<ReadCommand> assertStockCommandBytes(String table, String where, String... expectedHex) throws Exception
+    {
+        createCqlPinsTables();
+        String cql = String.format("SELECT * FROM \"%s\".%s %s", KEYSPACE, table, where);
+        SelectStatement select = (SelectStatement) QueryProcessor.getStatement(cql, ClientState.forInternalCalls());
+        ReadQuery query = select.getQuery(QueryOptions.DEFAULT, CQL_PINS_NOW_IN_SEC);
+        List<ReadCommand> commands = query instanceof SinglePartitionReadCommand.Group
+                                     ? new ArrayList<>(((SinglePartitionReadCommand.Group) query).queries)
+                                     : Collections.singletonList((ReadCommand) query);
+        assertEquals(cql, expectedHex.length, commands.size());
+
+        for (int version : new int[]{ MessagingService.VERSION_40, MessagingService.VERSION_50 })
+        {
+            for (int i = 0; i < commands.size(); i++)
+            {
+                try (DataOutputBuffer out = new DataOutputBuffer())
+                {
+                    ReadCommand.serializer.serialize(commands.get(i), out, version);
+                    assertEquals(cql + " at version " + version, expectedHex[i], ByteBufferUtil.bytesToHex(out.asNewBuffer()));
+                    assertEquals(out.getLength(), ReadCommand.serializer.serializedSize(commands.get(i), version));
+                }
+
+                try (DataInputBuffer in = new DataInputBuffer(ByteBufferUtil.hexToBytes(expectedHex[i]), false);
+                     DataOutputBuffer out = new DataOutputBuffer())
+                {
+                    ReadCommand read = ReadCommand.serializer.deserialize(in, version);
+                    assertEquals(0, in.available());
+                    ReadCommand.serializer.serialize(read, out, version);
+                    assertEquals(cql + " at version " + version, expectedHex[i], ByteBufferUtil.bytesToHex(out.asNewBuffer()));
+                }
+            }
+        }
+        return commands;
+    }
+
+    @Test
+    public void testStockCqlCommandBytesSinglePartition() throws Exception
+    {
+        assertStockCommandBytes(CQL_PINS, "WHERE pk = 1", "00006f1c2a503e4b11ee9a552f7c6b8d9e016553f10009000401740176016d0173000000f07ffffffff07fffffff0000000001000001010000060000");
+        assertStockCommandBytes(CQL_PINS, "WHERE pk = 1 AND ck = 2", "00006f1c2a503e4b11ee9a552f7c6b8d9e016553f10009000401740176016d0173000000f07ffffffff07fffffff00000000010100010000000002");
+        assertStockCommandBytes(CQL_PINS, "WHERE pk = 1 AND ck > 2 AND ck <= 5", "00006f1c2a503e4b11ee9a552f7c6b8d9e016553f10009000401740176016d0173000000f07ffffffff07fffffff000000000100000107000100000000020600010000000005");
+        assertStockCommandBytes(CQL_PINS, "WHERE pk = 1 AND ck IN (2, 3)", "00006f1c2a503e4b11ee9a552f7c6b8d9e016553f10009000401740176016d0173000000f07ffffffff07fffffff000000000101000200000000020000000003");
+        assertStockCommandBytes(CQL_PINS, "WHERE pk IN (1, 2)", "00006f1c2a503e4b11ee9a552f7c6b8d9e016553f10009000401740176016d0173000000f07ffffffff07fffffff0000000001000001010000060000", "00006f1c2a503e4b11ee9a552f7c6b8d9e016553f10009000401740176016d0173000000f07ffffffff07fffffff0000000002000001010000060000");
+        assertStockCommandBytes(CQL_PINS, "WHERE pk = 1 LIMIT 3", "00006f1c2a503e4b11ee9a552f7c6b8d9e016553f10009000401740176016d017300000003f07fffffff0000000001000001010000060000");
+    }
+
+    @Test
+    public void testStockCqlCommandBytesFiltering() throws Exception
+    {
+        assertStockCommandBytes(CQL_PINS, "WHERE s CONTAINS 'a' ALLOW FILTERING", "01006f1c2a503e4b11ee9a552f7c6b8d9e016553f10009000401740176016d01730001000001730000000500016100f07ffffffff07fffffff00000100000000010000000000000101000006000000");
+        assertStockCommandBytes(CQL_PINS, "WHERE m CONTAINS KEY 'a' ALLOW FILTERING", "01006f1c2a503e4b11ee9a552f7c6b8d9e016553f10009000401740176016d017300010000016d0000000600016100f07ffffffff07fffffff00000100000000010000000000000101000006000000");
+        assertStockCommandBytes(CQL_PINS, "WHERE m['a'] = 1 ALLOW FILTERING", "01006f1c2a503e4b11ee9a552f7c6b8d9e016553f10009000401740176016d017300010100016d0000000000016100040000000100f07ffffffff07fffffff00000100000000010000000000000101000006000000");
+        assertStockCommandBytes(CQL_PINS, "WHERE pk = 1 AND v > 1 AND v < 10 AND s CONTAINS 'a' ALLOW FILTERING", "00006f1c2a503e4b11ee9a552f7c6b8d9e016553f10009000401740176016d0173000300000173000000050001610000017600000002000400000001000001760000000400040000000a00f07ffffffff07fffffff0000000001000001010000060000");
+        assertStockCommandBytes(CQL_PINS, "WHERE v > 1 AND v < 10 AND m CONTAINS 2 ALLOW FILTERING", "01006f1c2a503e4b11ee9a552f7c6b8d9e016553f10009000401740176016d017300030000016d000000050004000000020000017600000002000400000001000001760000000400040000000a00f07ffffffff07fffffff00000100000000010000000000000101000006000000");
+        assertStockCommandBytes(CQL_PINS, "PER PARTITION LIMIT 2 LIMIT 10", "01006f1c2a503e4b11ee9a552f7c6b8d9e016553f10009000401740176016d01730000000a0200000100000000010000000000000101000006000000");
+    }
+
+    @Test
+    public void testStockCqlCommandBytesTokenRange() throws Exception
+    {
+        assertStockCommandBytes(CQL_PINS, "WHERE token(pk) > token(1) AND token(pk) <= token(5)", "01006f1c2a503e4b11ee9a552f7c6b8d9e016553f10009000401740176016d0173000000f07ffffffff07fffffff000402000000040000000102000000040000000500000101000006000000");
+    }
+
+    @Test
+    public void testStockCqlCommandBytesIndexQuery() throws Exception
+    {
+        List<ReadCommand> commands = assertStockCommandBytes(CQL_PINS_SAI, "WHERE t = 'x'", "01046f1c2a503e4b11ee9a552f7c6b8d9e026553f10009000101740001000001740000000000017800f07ffffffff07fffffff0060c515ec38dc354598ef7e006f2ce18900010000000880000000000000000100000008800000000000000001000100");
+        assertNotNull(commands.get(0).indexQueryPlan());
     }
 
 }
