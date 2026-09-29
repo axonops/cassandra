@@ -40,6 +40,7 @@ import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionPurger;
@@ -1046,6 +1047,8 @@ public class RowFilter implements Iterable<RowFilter.Expression>
                     }
                 case ANALYZER_MATCHES:
                 case PHRASE:
+                case ANALYZER_MATCHES_KEY:
+                case PHRASE_KEY:
                     {
                         // Re-analyzes the stored value with the index analyzer, since raw byte
                         // comparison cannot evaluate the analyzed operators. This also runs on the
@@ -1063,13 +1066,19 @@ public class RowFilter implements Iterable<RowFilter.Expression>
                             if (complexData == null)
                                 return false;
 
-                            // Each collection element is analyzed on its own, so a phrase never
-                            // matches across element boundaries.
-                            boolean elementIsCellPath = column.type instanceof SetType;
+                            boolean elementIsCellPath = column.type instanceof SetType || operator.targetsMapKeys();
+                            List<ByteBuffer> elements = new ArrayList<>();
                             for (Cell<?> cell : complexData)
+                                elements.add(elementIsCellPath ? cell.path().get(0) : cell.buffer());
+
+                            // MATCH takes each query token from any element or key, like the index path.
+                            // A phrase is matched within one element or key, never across two.
+                            if (operator.isAnalyzedMatch())
+                                return indexAnalyzer.matches(elements, value);
+
+                            for (ByteBuffer element : elements)
                             {
-                                ByteBuffer element = elementIsCellPath ? cell.path().get(0) : cell.buffer();
-                                if (analyzedMatch(indexAnalyzer, element))
+                                if (indexAnalyzer.matchesPhrase(element, value))
                                     return true;
                             }
                             return false;
@@ -1140,8 +1149,8 @@ public class RowFilter implements Iterable<RowFilter.Expression>
 
         private boolean analyzedMatch(Index.Analyzer indexAnalyzer, ByteBuffer storedValue)
         {
-            return operator == Operator.PHRASE ? indexAnalyzer.matchesPhrase(storedValue, value)
-                                               : indexAnalyzer.matches(storedValue, value);
+            return operator.isAnalyzedPhrase() ? indexAnalyzer.matchesPhrase(storedValue, value)
+                                               : indexAnalyzer.matches(Collections.singletonList(storedValue), value);
         }
 
         @Nullable
@@ -1149,7 +1158,8 @@ public class RowFilter implements Iterable<RowFilter.Expression>
         {
             // Benign race: concurrent first calls both resolve the same registry entry
             if (analyzer == null)
-                analyzer = IndexRegistry.obtain(metadata).analyzerFor(column);
+                analyzer = operator.targetsMapKeys() ? IndexRegistry.obtain(metadata).analyzerFor(column, IndexTarget.Type.KEYS)
+                                                     : IndexRegistry.obtain(metadata).analyzerFor(column);
             return analyzer.orElse(null);
         }
 
@@ -1179,6 +1189,12 @@ public class RowFilter implements Iterable<RowFilter.Expression>
                         CollectionType<?> collection = (CollectionType<?>) type;
                         type = collection.kind == CollectionType.Kind.SET ? collection.nameComparator() : collection.valueComparator();
                     }
+                    break;
+                case ANALYZER_MATCHES_KEY:
+                case PHRASE_KEY:
+                    // The key operators compare map keys, so the value has the map's key type
+                    if (type instanceof MapType)
+                        type = ((MapType<?, ?>) type).nameComparator();
                     break;
                 default:
                     break;

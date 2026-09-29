@@ -202,6 +202,41 @@ public class PhraseKeywordTest
     }
 
     @Test
+    public void testMapKeyOperators() throws Exception
+    {
+        assertEquals("MATCH KEY", Operator.ANALYZER_MATCHES_KEY.toString());
+        assertEquals("PHRASE KEY", Operator.PHRASE_KEY.toString());
+
+        WhereClause clause = WhereClause.parse("attrs MATCH KEY 'x'");
+        assertEquals(Operator.ANALYZER_MATCHES_KEY, clause.relations().get(0).operator());
+        assertEquals("attrs MATCH KEY 'x'", clause.toCQLString());
+
+        clause = WhereClause.parse("attrs PHRASE KEY ?");
+        assertEquals(Operator.PHRASE_KEY, clause.relations().get(0).operator());
+
+        // a bind marker after MATCH is the value, not the KEY keyword
+        clause = WhereClause.parse("attrs MATCH ?");
+        assertEquals(Operator.ANALYZER_MATCHES, clause.relations().get(0).operator());
+        clause = WhereClause.parse("attrs MATCH :key");
+        assertEquals(Operator.ANALYZER_MATCHES, clause.relations().get(0).operator());
+
+        // key as a column name
+        clause = WhereClause.parse("key MATCH 'x' AND key PHRASE KEY 'y'");
+        assertEquals(Operator.ANALYZER_MATCHES, clause.relations().get(0).operator());
+        assertEquals(Operator.PHRASE_KEY, clause.relations().get(1).operator());
+        assertTrue(parse("SELECT * FROM ks.t WHERE key MATCH KEY 'x'") instanceof SelectStatement.RawStatement);
+    }
+
+    @Test
+    public void testAnalyzedOperatorsTakeNoMapElement()
+    {
+        assertSyntaxError("SELECT * FROM ks.t WHERE m['k'] MATCH 'x'");
+        assertSyntaxError("SELECT * FROM ks.t WHERE m['k'] PHRASE 'x'");
+        assertSyntaxError("SELECT * FROM ks.t WHERE m['k'] MATCH KEY 'x'");
+        assertSyntaxError("SELECT * FROM ks.t WHERE m['k'] PHRASE KEY 'x'");
+    }
+
+    @Test
     public void testColonIsNotAnOperator()
     {
         assertSyntaxError("SELECT * FROM ks.t WHERE body : 'x'");
@@ -217,6 +252,8 @@ public class PhraseKeywordTest
         assertSyntaxError("DELETE FROM ks.t WHERE k = 0 IF body MATCH 'x'");
         assertSyntaxError("UPDATE ks.t SET v = 'a' WHERE k = 0 IF body PHRASE 'x'");
         assertSyntaxError("UPDATE ks.t SET v = 'a' WHERE k = 0 IF body : 'x'");
+        assertSyntaxError("UPDATE ks.t SET v = 'a' WHERE k = 0 IF attrs MATCH KEY 'x'");
+        assertSyntaxError("DELETE FROM ks.t WHERE k = 0 IF attrs PHRASE KEY 'x'");
     }
 
     @Test

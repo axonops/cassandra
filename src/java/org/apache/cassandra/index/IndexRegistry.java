@@ -32,6 +32,7 @@ import javax.annotation.Nullable;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
@@ -331,6 +332,26 @@ public interface IndexRegistry
         for (Index index : listIndexes())
         {
             Optional<Index.Analyzer> analyzer = index.analyzerFor(column);
+            if (analyzer.isPresent())
+                return analyzer;
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Returns the analysis view of the first registered index that analyzes the given column and
+     * target, empty when no registered index does. Used to evaluate {@code MATCH KEY} and
+     * {@code PHRASE KEY}, which search map keys, in row filters.
+     *
+     * @param column the target column of a search query predicate
+     * @param targetType the part of the column the predicate searches
+     * @return an {@link Index.Analyzer} for the target, empty when no index analyzes it
+     */
+    default Optional<Index.Analyzer> analyzerFor(ColumnMetadata column, IndexTarget.Type targetType)
+    {
+        for (Index index : listIndexes())
+        {
+            Optional<Index.Analyzer> analyzer = index.analyzerFor(column, targetType);
             if (analyzer.isPresent())
                 return analyzer;
         }

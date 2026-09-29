@@ -483,7 +483,8 @@ public class StorageAttachedIndex implements Index
     public boolean supportsExpression(ColumnMetadata column, Operator operator)
     {
         if (operator.isAnalyzed())
-            return dependsOn(column) && hasLuceneAnalyzer() && indexTermType.isLiteral();
+            return dependsOn(column) && hasLuceneAnalyzer() && indexTermType.isLiteral()
+                   && analyzesTarget(operator.targetsMapKeys() ? IndexTarget.Type.KEYS : IndexTarget.Type.VALUES);
 
         // An index_analyzer index holds words, not whole elements or keys. EQ stays supported
         // because equals_behaviour_when_analyzed may rewrite it to MATCH.
@@ -496,10 +497,28 @@ public class StorageAttachedIndex implements Index
     @Override
     public Optional<Index.Analyzer> analyzerFor(ColumnMetadata column)
     {
-        if (analysisView == null || !dependsOn(column))
+        return analyzerFor(column, IndexTarget.Type.VALUES);
+    }
+
+    @Override
+    public Optional<Index.Analyzer> analyzerFor(ColumnMetadata column, IndexTarget.Type targetType)
+    {
+        if (analysisView == null || !dependsOn(column) || !analyzesTarget(targetType))
             return Optional.empty();
 
         return Optional.of(analysisView);
+    }
+
+    /**
+     * An index on map keys serves {@link IndexTarget.Type#KEYS}. An index on a column's values or
+     * collection elements serves any other type.
+     */
+    private boolean analyzesTarget(IndexTarget.Type targetType)
+    {
+        IndexTarget.Type indexedTarget = indexTermType.indexTargetType();
+        if (targetType == IndexTarget.Type.KEYS)
+            return indexedTarget == IndexTarget.Type.KEYS;
+        return indexedTarget == IndexTarget.Type.SIMPLE || indexedTarget == IndexTarget.Type.VALUES;
     }
 
     @Override
@@ -1087,19 +1106,18 @@ public class StorageAttachedIndex implements Index
         private volatile QueryTokens lastQueryTokens;
 
         @Override
-        public boolean matches(ByteBuffer storedValue, ByteBuffer queryValue)
+        public boolean matches(Collection<ByteBuffer> storedValues, ByteBuffer queryValue)
         {
             List<AnalyzedToken> queryTokens = queryTokens(queryValue);
             if (queryTokens.isEmpty())
                 return false;
 
-            List<AnalyzedToken> storedTokens = luceneIndexAnalyzer.analyze(storedValue.duplicate());
-            if (storedTokens.isEmpty())
-                return false;
-
-            Set<ByteBuffer> stored = new HashSet<>(storedTokens.size());
-            for (AnalyzedToken token : storedTokens)
-                stored.add(token.bytes());
+            Set<ByteBuffer> stored = new HashSet<>();
+            for (ByteBuffer storedValue : storedValues)
+            {
+                for (AnalyzedToken token : luceneIndexAnalyzer.analyze(storedValue.duplicate()))
+                    stored.add(token.bytes());
+            }
 
             for (AnalyzedToken token : queryTokens)
             {

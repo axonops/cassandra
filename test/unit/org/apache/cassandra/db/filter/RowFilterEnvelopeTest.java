@@ -99,8 +99,8 @@ public class RowFilterEnvelopeTest
             assertTrue(operator.name(), operator.isForkOperator());
         }
 
-        // ANALYZER_MATCHES and PHRASE must not use a reserved code.
-        Operator[] forkOperators = { Operator.ANALYZER_MATCHES, Operator.PHRASE };
+        // None of these operators may use a reserved code.
+        Operator[] forkOperators = { Operator.ANALYZER_MATCHES, Operator.PHRASE, Operator.ANALYZER_MATCHES_KEY, Operator.PHRASE_KEY };
         for (Operator operator : forkOperators)
         {
             assertTrue(operator.name(), operator.isForkOperator());

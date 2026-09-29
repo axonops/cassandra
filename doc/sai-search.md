@@ -157,15 +157,15 @@ token may come from any element.
 CONTAINS and CONTAINS KEY always compare whole elements and whole keys. An index with an
 `index_analyzer` holds words, so it cannot answer them. When every index on the target is
 analyzed, they are refused with or without ALLOW FILTERING. CONTAINS is refused with an
-error that points to `MATCH` or `PHRASE`. CONTAINS KEY is refused with an error saying
-word search over map keys is not available. When another index covers the same target,
+error that points to `MATCH` or `PHRASE`. CONTAINS KEY is refused with an error that points
+to `MATCH KEY` or `PHRASE KEY`. When another index covers the same target,
 for example a plain storage-attached index or a legacy secondary index, that index answers
 CONTAINS and CONTAINS KEY as usual.
 
-`MATCH` requires a storage-attached index with an `index_analyzer` on the column. It is
-not allowed in UPDATE or DELETE WHERE clauses. LWT IF conditions never take `MATCH` or
-`PHRASE`: such a condition is a syntax error, and conditions always compare raw column
-values.
+`MATCH` requires a storage-attached index with an `index_analyzer` on the column. `MATCH`,
+`PHRASE`, `MATCH KEY` and `PHRASE KEY` are not allowed in UPDATE or DELETE WHERE clauses. LWT IF conditions never take `MATCH`,
+`PHRASE`, `MATCH KEY` or `PHRASE KEY`: such a condition is a syntax error, and conditions
+always compare raw column values.
 
 `MATCH` is an unreserved keyword, so `match` can be used as a column, table or user name.
 There is no `:` operator. `column : 'value'` is a syntax error, write it as `column MATCH 'value'`.
@@ -189,6 +189,25 @@ matches across element boundaries.
 Phrase candidates are intersected inside each index segment on the stored positions, and
 every returned row is re-checked by re-analyzing the stored value, on the replica and,
 for reads that reconcile multiple replicas, again on the coordinator.
+
+## `MATCH KEY` and `PHRASE KEY` on map keys
+
+`MATCH KEY` and `PHRASE KEY` search the keys of a non-frozen map through an analyzed index
+on `KEYS(column)`:
+
+    CREATE INDEX ON ks.events (KEYS(attrs)) USING 'sai' WITH OPTIONS = {'index_analyzer': 'standard'};
+    SELECT * FROM ks.events WHERE attrs MATCH KEY 'error code';
+    SELECT * FROM ks.events WHERE attrs PHRASE KEY 'error code';
+
+`MATCH KEY` has the semantics of `MATCH` over the keys: each token may come from any key.
+`PHRASE KEY` has the semantics of `PHRASE` within one key: a phrase never matches across
+two keys. `attrs MATCH 'x'` and `attrs PHRASE 'x'` search the map's values, through an
+analyzed index on `VALUES(attrs)`. A map can have both indexes, each with its own analyzer.
+
+`MATCH KEY` and `PHRASE KEY` need a non-frozen map column, and are refused on any other
+column. Without an analyzed index on `KEYS(column)` they are refused with an error naming
+that index, also when the map has an analyzed index on its values. `CONTAINS KEY` compares
+whole keys, through a plain index on `KEYS(column)`.
 
 ## `=` on analyzed columns
 
@@ -243,8 +262,9 @@ without regular column restrictions, exactly as for conjunctions.
 
 ## Cluster upgrade rule
 
-The `MATCH` and `PHRASE` operators, `=` under `MATCH` behaviour, and `OR` in WHERE clauses
-are refused with an InvalidRequest error until every node in the cluster runs this build.
+The `MATCH`, `PHRASE`, `MATCH KEY` and `PHRASE KEY` operators, `=` under `MATCH`
+behaviour, and `OR` in WHERE clauses are refused with an InvalidRequest error until every
+node in the cluster runs this build.
 Nodes advertise a fork messaging version and the coordinator checks that all live peers
 speak it before accepting one of these queries. During a rolling upgrade the queries fail
 fast with a message naming a node that has not been upgraded, instead of returning wrong

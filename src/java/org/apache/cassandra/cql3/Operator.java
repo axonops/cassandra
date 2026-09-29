@@ -287,8 +287,7 @@ public enum Operator
         @Override
         public boolean isSatisfiedBy(AbstractType<?> type, ByteBuffer leftOperand, ByteBuffer rightOperand)
         {
-            // Evaluation needs the index analyzer, which raw bytes cannot provide. RowFilter evaluates
-            // this operator through the Index.Analyzer surface instead of calling this method.
+            // RowFilter evaluates this operator with the index analyzer (Index.Analyzer).
             throw new UnsupportedOperationException();
         }
     },
@@ -303,8 +302,37 @@ public enum Operator
         @Override
         public boolean isSatisfiedBy(AbstractType<?> type, ByteBuffer leftOperand, ByteBuffer rightOperand)
         {
-            // Evaluation needs the index analyzer, which raw bytes cannot provide. RowFilter evaluates
-            // this operator through the Index.Analyzer surface instead of calling this method.
+            // RowFilter evaluates this operator with the index analyzer (Index.Analyzer).
+            throw new UnsupportedOperationException();
+        }
+    },
+    ANALYZER_MATCHES_KEY(206)
+    {
+        @Override
+        public String toString()
+        {
+            return "MATCH KEY";
+        }
+
+        @Override
+        public boolean isSatisfiedBy(AbstractType<?> type, ByteBuffer leftOperand, ByteBuffer rightOperand)
+        {
+            // RowFilter evaluates this operator with the index analyzer (Index.Analyzer).
+            throw new UnsupportedOperationException();
+        }
+    },
+    PHRASE_KEY(207)
+    {
+        @Override
+        public String toString()
+        {
+            return "PHRASE KEY";
+        }
+
+        @Override
+        public boolean isSatisfiedBy(AbstractType<?> type, ByteBuffer leftOperand, ByteBuffer rightOperand)
+        {
+            // RowFilter evaluates this operator with the index analyzer (Index.Analyzer).
             throw new UnsupportedOperationException();
         }
     };
@@ -415,13 +443,42 @@ public enum Operator
     }
 
     /**
-     * Checks if this operator is evaluated through an index analyzer, i.e. the {@code MATCH}
-     * operator or the {@code PHRASE} operator.
+     * Checks if this operator is evaluated through an index analyzer, i.e. {@code MATCH},
+     * {@code PHRASE}, {@code MATCH KEY} or {@code PHRASE KEY}.
      * @return {@code true} if this operator needs an index analyzer, {@code false} otherwise.
      */
     public boolean isAnalyzed()
     {
-        return this == ANALYZER_MATCHES || this == PHRASE;
+        return isAnalyzedMatch() || isAnalyzedPhrase();
+    }
+
+    /**
+     * Checks if this operator matches every query token in any order, i.e. {@code MATCH} or
+     * {@code MATCH KEY}.
+     * @return {@code true} if this operator is an analyzed match, {@code false} otherwise.
+     */
+    public boolean isAnalyzedMatch()
+    {
+        return this == ANALYZER_MATCHES || this == ANALYZER_MATCHES_KEY;
+    }
+
+    /**
+     * Checks if this operator matches the query tokens at adjacent positions, i.e. {@code PHRASE}
+     * or {@code PHRASE KEY}.
+     * @return {@code true} if this operator is an analyzed phrase, {@code false} otherwise.
+     */
+    public boolean isAnalyzedPhrase()
+    {
+        return this == PHRASE || this == PHRASE_KEY;
+    }
+
+    /**
+     * Checks if this operator searches the keys of a map, i.e. {@code MATCH KEY} or {@code PHRASE KEY}.
+     * @return {@code true} if this operator searches map keys, {@code false} otherwise.
+     */
+    public boolean targetsMapKeys()
+    {
+        return this == ANALYZER_MATCHES_KEY || this == PHRASE_KEY;
     }
 
     /**

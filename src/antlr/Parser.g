@@ -1787,8 +1787,8 @@ relationType returns [Operator op]
 relation[WhereClause.Builder clauses]
     : name=cident type=relationType t=term { $clauses.add(new SingleColumnRelation(name, type, t)); }
     | name=cident K_LIKE t=term { $clauses.add(new SingleColumnRelation(name, Operator.LIKE, t)); }
-    | name=cident K_MATCH t=term { $clauses.add(new SingleColumnRelation(name, Operator.ANALYZER_MATCHES, t)); }
-    | name=cident K_PHRASE t=term { $clauses.add(new SingleColumnRelation(name, Operator.PHRASE, t)); }
+    | name=cident rt=matchOperator t=term { $clauses.add(new SingleColumnRelation(name, rt, t)); }
+    | name=cident rt=phraseOperator t=term { $clauses.add(new SingleColumnRelation(name, rt, t)); }
     | name=cident K_IS K_NOT K_NULL { $clauses.add(new SingleColumnRelation(name, Operator.IS_NOT, Constants.NULL_LITERAL)); }
     | K_TOKEN l=tupleOfIdentifiers type=relationType t=term
         { $clauses.add(new TokenRelation(l, type, t)); }
@@ -1818,6 +1818,14 @@ relation[WhereClause.Builder clauses]
       | type=relationType tupleMarker=markerForTuple /* (a, b, c) >= ? */
           { $clauses.add(MultiColumnRelation.createNonInRelation(ids, type, tupleMarker)); }
       )
+    ;
+
+matchOperator returns [Operator o]
+    : K_MATCH { o = Operator.ANALYZER_MATCHES; } (K_KEY { o = Operator.ANALYZER_MATCHES_KEY; })?
+    ;
+
+phraseOperator returns [Operator o]
+    : K_PHRASE { o = Operator.PHRASE; } (K_KEY { o = Operator.PHRASE_KEY; })?
     ;
 
 containsOperator returns [Operator o]

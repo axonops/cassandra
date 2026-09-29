@@ -157,6 +157,8 @@ public abstract class Relation
                 return newLikeRestriction(table, boundNames, relationType);
             case ANALYZER_MATCHES:
             case PHRASE:
+            case ANALYZER_MATCHES_KEY:
+            case PHRASE_KEY:
                 return newAnalyzerMatchesRestriction(table, boundNames, relationType);
             case ANN:
                 throw invalidRequest("ANN is only supported in ORDER BY");

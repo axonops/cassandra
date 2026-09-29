@@ -114,10 +114,14 @@ public abstract class Expression
                 case ANN:
                     return ANN;
 
+                // The key operators search an index on map keys the same way the value operators
+                // search an index on values
                 case ANALYZER_MATCHES:
+                case ANALYZER_MATCHES_KEY:
                     return ANALYZER_MATCHES;
 
                 case PHRASE:
+                case PHRASE_KEY:
                     return PHRASE;
 
                 default:
@@ -190,6 +194,7 @@ public abstract class Expression
             case CONTAINS:
             case CONTAINS_KEY:
             case ANALYZER_MATCHES:
+            case ANALYZER_MATCHES_KEY:
                 lower = new Bound(value, indexTermType, true);
                 upper = lower;
                 operator = IndexOperator.valueOf(op);
@@ -238,6 +243,7 @@ public abstract class Expression
                 upper = lower;
                 break;
             case PHRASE:
+            case PHRASE_KEY:
                 // Reached only without a backing analyzed index, e.g. the index was dropped while
                 // the query ran. There is no analyzer to evaluate the phrase with, so it matches
                 // nothing. An indexed phrase expression is built with phrase() instead.

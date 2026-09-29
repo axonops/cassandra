@@ -134,6 +134,42 @@ public class AnalyzedSearchDistributedTest extends TestBaseImpl
     }
 
     @Test
+    public void divergedMapKeysAreResolvedByReanalysis()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.diverged_keys (pk int PRIMARY KEY, attrs map<text, text>) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX diverged_keys_idx ON %s.diverged_keys(KEYS(attrs)) USING 'sai' " +
+                                          "WITH OPTIONS = { 'index_analyzer' : 'standard' }"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX diverged_values_idx ON %s.diverged_keys(VALUES(attrs)) USING 'sai' " +
+                                          "WITH OPTIONS = { 'index_analyzer' : 'standard' }"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        int pk = 0;
+        List<Integer> replicas = replicaNodesFor(pk);
+        assertEquals(2, replicas.size());
+
+        // One replica indexed a stale key 'quick brown fox'. The other holds the newer map, whose
+        // only key is 'lazy dog' and whose value repeats the stale words.
+        CLUSTER.get(replicas.get(0)).executeInternal(withKeyspace("INSERT INTO %s.diverged_keys (pk, attrs) VALUES (?, {'quick brown fox': 'a'}) USING TIMESTAMP 1"),
+                                                     pk);
+        CLUSTER.get(replicas.get(1)).executeInternal(withKeyspace("INSERT INTO %s.diverged_keys (pk, attrs) VALUES (?, {'lazy dog': 'quick brown fox'}) USING TIMESTAMP 2"),
+                                                     pk);
+
+        // The stale key match must be dropped by the coordinator re-analyzing the keys of the merged map
+        assertEquals(0, quorumCount("SELECT pk FROM %s.diverged_keys WHERE attrs MATCH KEY 'fox'"));
+        assertEquals(0, quorumCount("SELECT pk FROM %s.diverged_keys WHERE attrs PHRASE KEY 'quick brown'"));
+
+        // The newest key matches even though only one replica has it indexed
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.diverged_keys WHERE attrs MATCH KEY 'lazy dog'"), ConsistencyLevel.QUORUM),
+                   row(pk));
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.diverged_keys WHERE attrs PHRASE KEY 'lazy dog'"), ConsistencyLevel.QUORUM),
+                   row(pk));
+
+        // The same words in the newest value are found through the index on the values
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.diverged_keys WHERE attrs MATCH 'fox'"), ConsistencyLevel.QUORUM),
+                   row(pk));
+    }
+
+    @Test
     public void partialRowsAcrossReplicasMergeCorrectly()
     {
         CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.partial (pk int PRIMARY KEY, a text, b text) WITH read_repair = 'NONE'"));

@@ -170,6 +170,15 @@ public class IndexTermType
     }
 
     /**
+     * @return the part of the column this index holds, for example {@link IndexTarget.Type#KEYS} for the
+     * keys of a map
+     */
+    public IndexTarget.Type indexTargetType()
+    {
+        return indexTargetType;
+    }
+
+    /**
      * Returns {@code true} if the index type is a literal type and will use a literal index. This applies to
      * string types, frozen types, composite types and boolean type.
      */

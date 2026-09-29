@@ -190,13 +190,13 @@ public class Operation
 
     private static void buildIndexedExpression(StorageAttachedIndex index, RowFilter.Expression expression, List<Expression> perColumn)
     {
-        if (index.hasLuceneAnalyzer() && expression.operator() == Operator.PHRASE)
+        if (index.hasLuceneAnalyzer() && expression.operator().isAnalyzedPhrase())
         {
             List<AnalyzedToken> tokens = index.luceneQueryAnalyzer().analyze(expression.getIndexValue().duplicate());
             traceQueryTokens(index, expression, tokens);
             perColumn.add(Expression.create(index).phrase(tokens));
         }
-        else if (index.hasLuceneAnalyzer() && (expression.operator() == Operator.ANALYZER_MATCHES
+        else if (index.hasLuceneAnalyzer() && (expression.operator().isAnalyzedMatch()
                                                || index.termType().isMultiExpression(expression)))
         {
             // One Expression per distinct query analyzer token, AND semantics downstream. This shape
@@ -335,6 +335,14 @@ public class Operation
                         indexTargetType = IndexTarget.Type.VALUES;
                         break;
                     case CONTAINS_KEY:
+                        indexTargetType = IndexTarget.Type.KEYS;
+                        break;
+                    case ANALYZER_MATCHES:
+                    case PHRASE:
+                        indexTargetType = IndexTarget.Type.VALUES;
+                        break;
+                    case ANALYZER_MATCHES_KEY:
+                    case PHRASE_KEY:
                         indexTargetType = IndexTarget.Type.KEYS;
                         break;
                     default:

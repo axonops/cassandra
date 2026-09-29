@@ -85,7 +85,9 @@ public final class StatementRestrictions
             "Column '%s' has an analyzed index: CONTAINS compares whole elements, use MATCH or PHRASE for word search.";
 
     public static final String ANALYZED_CONTAINS_KEY_MESSAGE =
-            "Column '%s' has an analyzed index on its keys: CONTAINS KEY compares whole keys. Word search over map keys is not available.";
+            "Column '%s' has an analyzed index on its keys: CONTAINS KEY compares whole keys, use MATCH KEY or PHRASE KEY for word search.";
+
+    public static final String MAP_KEYS_OPERATOR_REQUIRES_INDEX_MESSAGE = "%s needs an index with an index_analyzer on KEYS(%s).";
 
     /**
      * The type of statement
@@ -267,8 +269,7 @@ public final class StatementRestrictions
                 Restriction restriction = relation.toRestriction(table, boundNames);
 
                 if (!type.allowUseOfSecondaryIndices() || !restriction.hasSupportingIndex(indexRegistry))
-                    throw new InvalidRequestException(String.format(ANALYZED_OPERATOR_REQUIRES_INDEX_MESSAGE,
-                                                                    relation.operator(), relation));
+                    throw analyzedOperatorRequiresIndex(relation, restriction);
 
                 addRestriction(restriction, indexRegistry);
             }
@@ -540,6 +541,18 @@ public final class StatementRestrictions
             throw invalidRequest(relation.isContains() ? ANALYZED_CONTAINS_MESSAGE : ANALYZED_CONTAINS_KEY_MESSAGE, column.name);
     }
 
+    /**
+     * The error for an analyzed operator no index can serve. MATCH KEY and PHRASE KEY name the index
+     * to create, because an analyzed index on the map's values does not serve them.
+     */
+    private static InvalidRequestException analyzedOperatorRequiresIndex(Relation relation, Restriction restriction)
+    {
+        if (relation.operator().targetsMapKeys())
+            return invalidRequest(MAP_KEYS_OPERATOR_REQUIRES_INDEX_MESSAGE, relation.operator(), restriction.getFirstColumn().name);
+
+        return invalidRequest(ANALYZED_OPERATOR_REQUIRES_INDEX_MESSAGE, relation.operator(), relation);
+    }
+
     private SingleRestriction prepareDisjunctionLeaf(Relation relation,
                                                      VariableSpecifications boundNames,
                                                      IndexRegistry indexRegistry)
@@ -575,7 +588,7 @@ public final class StatementRestrictions
         if (relation.operator().isAnalyzed()
             && (!type.allowUseOfSecondaryIndices() || !restriction.hasSupportingIndex(indexRegistry)))
         {
-            throw invalidRequest(ANALYZED_OPERATOR_REQUIRES_INDEX_MESSAGE, relation.operator(), relation);
+            throw analyzedOperatorRequiresIndex(relation, restriction);
         }
 
         return (SingleRestriction) restriction;

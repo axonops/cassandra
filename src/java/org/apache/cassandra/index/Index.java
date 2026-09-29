@@ -38,6 +38,7 @@ import javax.annotation.Nullable;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.restrictions.Restriction;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionTime;
@@ -431,11 +432,14 @@ public interface Index
     {
         /**
          * The {@code MATCH} operator semantics: analyzes the query value with the query analyzer and
-         * the stored value with the index analyzer.
+         * each stored value with the index analyzer. The stored values are the elements or keys of
+         * a collection, or the single value of any other column, and each query token may come from
+         * any of them.
          *
-         * @return true when every query token appears among the stored value's tokens
+         * @return true when every query token appears among the stored values' tokens, false when the
+         * query value analyzes to no tokens
          */
-        boolean matches(ByteBuffer storedValue, ByteBuffer queryValue);
+        boolean matches(Collection<ByteBuffer> storedValues, ByteBuffer queryValue);
 
         /**
          * The {@code PHRASE} operator semantics: analyzes both sides keeping positions and requires
@@ -454,12 +458,26 @@ public interface Index
 
     /**
      * Returns the analysis view of this index over the given column, empty unless this index
-     * analyzes that column's values.
+     * analyzes that column's values or collection elements. An index on map keys never answers here.
      *
      * @param column the target column of a search query predicate
      * @return the index's {@link Analyzer} for the column, empty when the index does not analyze it
      */
     default Optional<Analyzer> analyzerFor(ColumnMetadata column)
+    {
+        return Optional.empty();
+    }
+
+    /**
+     * Returns the analysis view of this index over the given column and target, empty unless this
+     * index analyzes that target. {@link IndexTarget.Type#KEYS} asks for an index on map keys, any
+     * other type for an index on values or collection elements.
+     *
+     * @param column the target column of a search query predicate
+     * @param targetType the part of the column the predicate searches
+     * @return the index's {@link Analyzer} for the target, empty when the index does not analyze it
+     */
+    default Optional<Analyzer> analyzerFor(ColumnMetadata column, IndexTarget.Type targetType)
     {
         return Optional.empty();
     }

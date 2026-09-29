@@ -267,9 +267,6 @@ public final class SingleColumnRelation extends Relation
     @Override
     protected Restriction newAnalyzerMatchesRestriction(TableMetadata table, VariableSpecifications boundNames, Operator operator)
     {
-        if (mapKey != null)
-            throw invalidRequest("%s can't be used with map elements.", operator);
-
         ColumnMetadata columnDef = table.getExistingColumn(entity);
         Term term = toTerm(toReceivers(columnDef), value, table.keyspace, boundNames);
 
@@ -288,6 +285,8 @@ public final class SingleColumnRelation extends Relation
 
         checkFalse(isContainsKey() && !(receiver.type instanceof MapType), "Cannot use CONTAINS KEY on non-map column %s", receiver.name);
         checkFalse(isContains() && !(receiver.type.isCollection()), "Cannot use CONTAINS on non-collection column %s", receiver.name);
+        checkFalse(relationType.targetsMapKeys() && !(receiver.type instanceof MapType && receiver.type.isMultiCell()),
+                   "MATCH KEY and PHRASE KEY need a non-frozen map column, %s is not one", receiver.name);
 
         if (mapKey != null)
         {
@@ -318,8 +317,9 @@ public final class SingleColumnRelation extends Relation
             }
             else if (relationType.isAnalyzed() && receiver.type.isMultiCell())
             {
-                // The analyzed operators match individual collection elements, like CONTAINS
-                receiver = makeCollectionReceiver(receiver, false);
+                // The analyzed operators match individual collection elements, like CONTAINS, and
+                // MATCH KEY and PHRASE KEY match individual map keys, like CONTAINS KEY
+                receiver = makeCollectionReceiver(receiver, relationType.targetsMapKeys());
             }
             else if (receiver.type.isMultiCell() && mapKey != null && isEQ())
             {

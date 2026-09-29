@@ -186,6 +186,23 @@ public class AnalyzerMatchesQueryTest extends SAITester
     }
 
     @Test
+    public void matchPostFilteredBehindALegacyIndexTakesTokensFromAnyElement() throws Throwable
+    {
+        createTable("CREATE TABLE %s (id int PRIMARY KEY, val set<text>, other int)");
+        createIndex("CREATE INDEX ON %s(val) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        createIndex("CREATE INDEX ON %s(other) USING 'legacy_local_table'");
+
+        execute("INSERT INTO %s (id, val, other) VALUES (1, {'quick fox', 'lazy dog'}, 5)");
+        execute("INSERT INTO %s (id, val, other) VALUES (2, {'quick fox'}, 5)");
+        execute("INSERT INTO %s (id, val, other) VALUES (3, {'quick fox', 'lazy dog'}, 6)");
+
+        // Two index implementations need ALLOW FILTERING. The legacy index plan wins by default, so
+        // the row filter re-checks MATCH on its rows. 'quick' and 'dog' come from two different
+        // elements of row 1.
+        beforeAndAfterFlush(() -> assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE val MATCH 'quick dog' AND other = 5 ALLOW FILTERING"), row(1)));
+    }
+
+    @Test
     public void containsFiltersAreNotPlannedOnAnalyzedIndexes() throws Throwable
     {
         createTable("CREATE TABLE %s (id int PRIMARY KEY, val set<text>, m map<text, text>)");
@@ -208,6 +225,10 @@ public class AnalyzerMatchesQueryTest extends SAITester
         RowFilter match = RowFilter.create(false);
         match.add(val, Operator.ANALYZER_MATCHES, UTF8Type.instance.decompose("quick"));
         assertNotNull(cfs.indexManager.getBestIndexQueryPlanFor(match));
+
+        RowFilter matchKey = RowFilter.create(false);
+        matchKey.add(m, Operator.ANALYZER_MATCHES_KEY, UTF8Type.instance.decompose("colour"));
+        assertNotNull(cfs.indexManager.getBestIndexQueryPlanFor(matchKey));
     }
 
     @Test
@@ -253,6 +274,14 @@ public class AnalyzerMatchesQueryTest extends SAITester
         assertInvalidMessage("Cannot use DELETE with MATCH",
                              "DELETE FROM %s WHERE body MATCH 'quick'");
         assertInvalidSyntax("UPDATE %s SET body = 'x' WHERE id = 1 IF body MATCH 'quick'");
+
+        createTable("CREATE TABLE %s (id int PRIMARY KEY, attrs map<text, text>)");
+        createIndex("CREATE INDEX ON %s(KEYS(attrs)) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+
+        assertInvalidMessage("Cannot use UPDATE with MATCH KEY",
+                             "UPDATE %s SET attrs = {} WHERE attrs MATCH KEY 'quick'");
+        assertInvalidMessage("Cannot use DELETE with PHRASE KEY",
+                             "DELETE FROM %s WHERE attrs PHRASE KEY 'quick'");
     }
 
     @Test
