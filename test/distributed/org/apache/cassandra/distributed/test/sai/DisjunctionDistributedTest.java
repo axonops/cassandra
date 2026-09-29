@@ -53,8 +53,10 @@ import static org.apache.cassandra.distributed.shared.AssertUtils.row;
  * disjunctions, the same splits on the filtering path when no index serves the disjunction, and IN
  * re-checked on merged rows: replica filtering protection divergence
  * where an AND branch under OR matches only the merged row, the strict coordinator re-filter
- * dropping stale local matches, analyzed leaves inside disjunctions, and the cluster version
- * gate refusing OR while a peer speaks the vanilla messaging version.
+ * dropping stale local matches, analyzed leaves inside disjunctions, the cluster version
+ * gate refusing OR while a peer speaks the vanilla messaging version, and several relations on
+ * one column inside one OR branch: a pair refused at every consistency level and a merged slice
+ * over rows split across replicas.
  */
 public class DisjunctionDistributedTest extends TestBaseImpl
 {
@@ -620,6 +622,64 @@ public class DisjunctionDistributedTest extends TestBaseImpl
         // Once the peer advertises the fork version again the query is accepted
         assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.gate WHERE a = 1 OR b = 2"), ConsistencyLevel.ALL),
                    row(0));
+    }
+
+    @Test
+    public void sameColumnPairInOneBranchIsRefusedAtEveryConsistency()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.same_column (pk int PRIMARY KEY, a int, b int, c text) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX same_column_a_idx ON %s.same_column(a) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX same_column_b_idx ON %s.same_column(b) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX same_column_c_idx ON %s.same_column(c) USING 'sai' WITH OPTIONS = { 'case_sensitive' : false }"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        String[] values = { "a", "d", "n", "x", "y", "z" };
+        for (int pk = 1; pk <= 6; pk++)
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.same_column (pk, a, b, c) VALUES (?, ?, ?, ?)"),
+                                           ConsistencyLevel.ALL, pk, pk, 10 * pk, values[pk - 1]);
+
+        // The pair is refused at every consistency level with the error it gets without OR
+        String query = withKeyspace("SELECT pk FROM %s.same_column WHERE (a = 5 AND a = 6) OR c = 'nomatch'");
+        for (ConsistencyLevel cl : new ConsistencyLevel[]{ ConsistencyLevel.ONE, ConsistencyLevel.QUORUM, ConsistencyLevel.ALL })
+        {
+            try
+            {
+                CLUSTER.coordinator(1).execute(query, cl);
+                fail("Two = on one column in one OR branch should be refused at " + cl);
+            }
+            catch (RuntimeException e)
+            {
+                assertTrue(e.getMessage(), e.getMessage().contains("a cannot be restricted by more than one relation if it includes an Equal"));
+            }
+        }
+    }
+
+    @Test
+    public void mergedSlicesInOneBranchKeepSplitRows()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.merged_slice (pk int, ck int, a int, b int, c text, PRIMARY KEY (pk, ck)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX merged_slice_a_idx ON %s.merged_slice(a) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX merged_slice_b_idx ON %s.merged_slice(b) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX merged_slice_c_idx ON %s.merged_slice(c) USING 'sai'"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        // One partition, rows split across a different pair of nodes each, as in disjunctionsSplitAcrossReplicas.
+        // ck 0 to 2 hold a = 2 on one node and b = 7 on the next. ck 10 to 12 are split the same way
+        // with a = 5, outside the slice, and never match.
+        for (int ck : new int[]{ 0, 1, 2, 10, 11, 12 })
+        {
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.merged_slice (pk, ck, a, b, c) VALUES (0, ?, 0, 0, '0') USING TIMESTAMP 1"),
+                                           ConsistencyLevel.ALL, ck);
+            int node = ck % 10 + 1;
+            CLUSTER.get(node).executeInternal(withKeyspace("UPDATE %s.merged_slice USING TIMESTAMP 2 SET a = ? WHERE pk = 0 AND ck = ?"), ck < 10 ? 2 : 5, ck);
+            CLUSTER.get(node % NODES + 1).executeInternal(withKeyspace("UPDATE %s.merged_slice USING TIMESTAMP 2 SET b = 7 WHERE pk = 0 AND ck = ?"), ck);
+        }
+
+        // Guard. The two bounds on a merge into one slice. Whatever pair QUORUM contacts, exactly one row
+        // has both halves inside it.
+        String query = "SELECT ck FROM %s.merged_slice WHERE (a > 0 AND a < 3 AND b = 7) OR c = 'q'";
+        assertEquals(ImmutableSet.of(0, 1, 2), valuesAt(query, ConsistencyLevel.ALL));
+        assertEquals(1, CLUSTER.coordinator(1).execute(withKeyspace(query), ConsistencyLevel.QUORUM).length);
     }
 
     private static void setPeerVersionOnNode1(int peer, int version)

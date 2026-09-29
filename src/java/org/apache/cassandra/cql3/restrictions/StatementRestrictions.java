@@ -46,6 +46,7 @@ import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.btree.BTreeSet;
 
 import org.apache.commons.lang3.builder.ToStringBuilder;
@@ -480,33 +481,71 @@ public final class StatementRestrictions
 
     /**
      * Validates one OR subtree of the WHERE clause and converts its relation leaves into
-     * restrictions, held per leaf and never merged.
+     * restrictions, one per leaf. Relations on one column in one AND group are also merged by the
+     * rules the root uses.
      */
     private DisjunctionHolder prepareDisjunction(WhereClause.OrElement element,
                                                  VariableSpecifications boundNames,
                                                  IndexRegistry indexRegistry)
     {
         Map<WhereClause.RelationElement, SingleRestriction> leafRestrictions = new IdentityHashMap<>();
-        prepareDisjunctionLeaves(element, boundNames, indexRegistry, leafRestrictions);
-        return new DisjunctionHolder(element, leafRestrictions);
+        DisjunctionHolder holder = new DisjunctionHolder(element, leafRestrictions);
+        prepareDisjunctionLeaves(element, boundNames, indexRegistry, holder);
+        return holder;
     }
 
     private void prepareDisjunctionLeaves(WhereClause.ContainerElement container,
                                           VariableSpecifications boundNames,
                                           IndexRegistry indexRegistry,
-                                          Map<WhereClause.RelationElement, SingleRestriction> leafRestrictions)
+                                          DisjunctionHolder holder)
     {
         for (WhereClause.ExpressionElement child : container.children())
         {
             if (child instanceof WhereClause.ContainerElement)
-                prepareDisjunctionLeaves((WhereClause.ContainerElement) child, boundNames, indexRegistry, leafRestrictions);
+                prepareDisjunctionLeaves((WhereClause.ContainerElement) child, boundNames, indexRegistry, holder);
             else if (child instanceof WhereClause.CustomIndexExpressionElement)
                 throw invalidRequest("Custom index expressions are not supported within OR expressions");
             else
             {
                 WhereClause.RelationElement leaf = (WhereClause.RelationElement) child;
-                leafRestrictions.put(leaf, prepareDisjunctionLeaf(leaf.relation(), boundNames, indexRegistry));
+                holder.leafRestrictions.put(leaf, prepareDisjunctionLeaf(leaf.relation(), boundNames, indexRegistry));
             }
+        }
+
+        // The direct leaves of an OR are separate branches and never merge
+        if (!(container instanceof WhereClause.AndElement))
+            return;
+
+        // Direct relations of an AND group on one column merge as at the root: the same mergeWith call
+        // in the order written, so a pair the root refuses is refused with the same text. Every leaf keeps
+        // its own restriction, so index support is judged per leaf.
+        Map<ColumnMetadata, List<WhereClause.RelationElement>> leavesByColumn = new LinkedHashMap<>();
+        for (WhereClause.ExpressionElement child : container.children())
+        {
+            if (child instanceof WhereClause.RelationElement)
+                leavesByColumn.computeIfAbsent(holder.leafRestrictions.get(child).getFirstColumn(), column -> new ArrayList<>())
+                              .add((WhereClause.RelationElement) child);
+        }
+
+        for (Map.Entry<ColumnMetadata, List<WhereClause.RelationElement>> entry : leavesByColumn.entrySet())
+        {
+            List<WhereClause.RelationElement> leaves = entry.getValue();
+            if (leaves.size() < 2)
+                continue;
+
+            SingleRestriction merged = holder.leafRestrictions.get(leaves.get(0));
+            try
+            {
+                for (WhereClause.RelationElement leaf : leaves.subList(1, leaves.size()))
+                    merged = merged.mergeWith(holder.leafRestrictions.get(leaf));
+            }
+            catch (InvalidRequestException e)
+            {
+                Tracing.trace("OR group refused for several relations on column {}", entry.getKey().name);
+                throw e;
+            }
+            holder.mergedRestrictions.put(leaves.get(0), merged);
+            holder.absorbedLeaves.addAll(leaves.subList(1, leaves.size()));
         }
     }
 
@@ -1068,13 +1107,45 @@ public final class StatementRestrictions
         // Each disjunction becomes an OR child of the root. This is a structural mapping of the
         // WHERE clause subtree, one AST node to one filter node, with no operator rewriting.
         for (DisjunctionHolder holder : disjunctions)
-            filter.root().addChild(toFilterElement(holder.element, holder.leafRestrictions, indexRegistry, options));
+        {
+            filter.root().addChild(toFilterElement(holder.element, holder, indexRegistry, options));
+            if (Tracing.isTracing())
+                traceMergedLeaves(holder.element, holder);
+        }
 
         return filter;
     }
 
+    /**
+     * Traces each column whose relations in one AND group of the disjunction were merged.
+     */
+    private static void traceMergedLeaves(WhereClause.ContainerElement container, DisjunctionHolder holder)
+    {
+        for (WhereClause.ExpressionElement child : container.children())
+        {
+            if (child instanceof WhereClause.ContainerElement)
+            {
+                traceMergedLeaves((WhereClause.ContainerElement) child, holder);
+                continue;
+            }
+
+            SingleRestriction merged = holder.mergedRestrictions.get(child);
+            if (merged == null)
+                continue;
+
+            int relations = 0;
+            for (WhereClause.ExpressionElement sibling : container.children())
+            {
+                if (sibling == child
+                    || (holder.absorbedLeaves.contains(sibling) && holder.leafRestrictions.get(sibling).getFirstColumn().equals(merged.getFirstColumn())))
+                    relations++;
+            }
+            Tracing.trace("OR group merged {} relations on column {}", relations, merged.getFirstColumn().name);
+        }
+    }
+
     private RowFilter.FilterElement toFilterElement(WhereClause.ContainerElement container,
-                                                    Map<WhereClause.RelationElement, SingleRestriction> leafRestrictions,
+                                                    DisjunctionHolder holder,
                                                     IndexRegistry indexRegistry,
                                                     QueryOptions options)
     {
@@ -1084,11 +1155,15 @@ public final class StatementRestrictions
         {
             if (child instanceof WhereClause.ContainerElement)
             {
-                node.addChild(toFilterElement((WhereClause.ContainerElement) child, leafRestrictions, indexRegistry, options));
+                node.addChild(toFilterElement((WhereClause.ContainerElement) child, holder, indexRegistry, options));
                 continue;
             }
 
-            SingleRestriction restriction = leafRestrictions.get(child);
+            // A relation merged into the first relation on its column is emitted with it, at its place
+            if (holder.absorbedLeaves.contains(child))
+                continue;
+
+            SingleRestriction restriction = holder.mergedRestrictions.getOrDefault(child, holder.leafRestrictions.get(child));
             RowFilter scratch = RowFilter.create(false);
             restriction.addToRowFilter(scratch, indexRegistry, options);
             List<RowFilter.Expression> expressions = scratch.root().expressions();
@@ -1383,6 +1458,10 @@ public final class StatementRestrictions
     {
         private final WhereClause.OrElement element;
         private final Map<WhereClause.RelationElement, SingleRestriction> leafRestrictions;
+        // The first relation on a column of an AND group, to the restriction merged from all of them
+        private final Map<WhereClause.RelationElement, SingleRestriction> mergedRestrictions = new IdentityHashMap<>();
+        // The later relations on such a column, emitted through the merged restriction
+        private final Set<WhereClause.RelationElement> absorbedLeaves = Collections.newSetFromMap(new IdentityHashMap<>());
 
         private DisjunctionHolder(WhereClause.OrElement element,
                                   Map<WhereClause.RelationElement, SingleRestriction> leafRestrictions)

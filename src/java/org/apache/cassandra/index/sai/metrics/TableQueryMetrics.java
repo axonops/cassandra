@@ -40,6 +40,10 @@ public class TableQueryMetrics extends AbstractMetrics
     private final Counter totalPartitionReads;
     private final Counter totalRowsFiltered;
     private final Counter totalQueriesCompleted;
+    // Expressions on one column that an index query kept apart instead of folding into one range, see
+    // Operation.buildIndexExpressionsKeptApart. Stays 0 while every coordinator merges the relations
+    // of an OR branch.
+    private final Counter totalSameColumnExpressionsKeptApart;
 
     public TableQueryMetrics(TableMetadata table)
     {
@@ -53,6 +57,7 @@ public class TableQueryMetrics extends AbstractMetrics
         totalRowsFiltered = Metrics.counter(createMetricName("TotalRowsFiltered"));
         totalQueriesCompleted = Metrics.counter(createMetricName("TotalQueriesCompleted"));
         totalQueryTimeouts = Metrics.counter(createMetricName("TotalQueryTimeouts"));
+        totalSameColumnExpressionsKeptApart = Metrics.counter(createMetricName("TotalSameColumnExpressionsKeptApart"));
     }
 
     public void record(QueryContext queryContext)
@@ -60,6 +65,7 @@ public class TableQueryMetrics extends AbstractMetrics
         if (queryContext.queryTimedOut)
             totalQueryTimeouts.inc();
 
+        totalSameColumnExpressionsKeptApart.inc(queryContext.sameColumnExpressionsKeptApart);
         perQueryMetrics.record(queryContext);
     }
 

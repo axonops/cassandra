@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.index.sai.cql;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -28,11 +29,14 @@ import org.junit.Test;
 
 import com.datastax.driver.core.Row;
 import com.datastax.driver.core.Session;
+import com.datastax.driver.core.exceptions.InvalidQueryException;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.cql3.restrictions.SingleColumnRestriction;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
 import org.apache.cassandra.cql3.statements.SelectStatement;
 import org.apache.cassandra.db.ConsistencyLevel;
@@ -47,8 +51,11 @@ import org.apache.cassandra.db.rows.RowIterator;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.TimeUUID;
 
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -565,12 +572,274 @@ public class DisjunctionQueryTest extends SAITester
             // Two word searches on one column next to an OR child need no ALLOW FILTERING
             assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE body MATCH 'timeout' AND body PHRASE 'after 30s' AND (v = 1 OR v = 2)"),
                                     row(2));
-            // Relations inside one OR branch are never merged
+            // Relations inside one OR branch merge as at the root, the slice is absorbed
             assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (body MATCH 'timeout' AND body > 'm') OR body MATCH 'disk' ALLOW FILTERING"),
                                     row(1), row(2));
             // A root IN next to an OR child is checked after the index
             assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE body IN ('Timeout', 'Disk full') AND (body MATCH 'timeout' OR body MATCH 'disk') ALLOW FILTERING"),
                                     row(4));
         });
+    }
+
+    @Test
+    public void sameColumnPairInOneBranchIsRefusedLikeTheRoot() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, a int, b int)");
+        createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(b) USING 'sai'");
+
+        for (int i = 1; i <= 6; i++)
+            execute("INSERT INTO %s (pk, a, b) VALUES (?, ?, ?)", i, i, 10 * i);
+
+        String equal = "a cannot be restricted by more than one relation if it includes an Equal";
+        String equalityAndInequality = "Column \"a\" cannot be restricted by both an equality and an inequality relation";
+        String startBound = "More than one restriction was found for the start bound on a";
+        String endBound = "More than one restriction was found for the end bound on a";
+
+        // Control. Without OR each pair gets the stock refusal
+        assertInvalidMessage(equal, "SELECT pk FROM %s WHERE a = 5 AND a > 0");
+        assertInvalidMessage(equalityAndInequality, "SELECT pk FROM %s WHERE a > 0 AND a = 5");
+        assertInvalidMessage(equal, "SELECT pk FROM %s WHERE a = 5 AND a = 6");
+        assertInvalidMessage(startBound, "SELECT pk FROM %s WHERE a > 2 AND a > 0");
+        assertInvalidMessage(endBound, "SELECT pk FROM %s WHERE a < 2 AND a < 5");
+
+        // Inside one OR branch the same pairs get the same refusals, with or without ALLOW FILTERING
+        assertInvalidMessage(equal, "SELECT pk FROM %s WHERE (a = 5 AND a > 0) OR b = 20");
+        assertInvalidMessage(equal, "SELECT pk FROM %s WHERE (a = 5 AND a > 0) OR b = 20 ALLOW FILTERING");
+        assertInvalidMessage(equalityAndInequality, "SELECT pk FROM %s WHERE (a > 0 AND a = 5) OR b = 20");
+        assertInvalidMessage(equal, "SELECT pk FROM %s WHERE (a = 5 AND a = 6) OR b = 20");
+        assertInvalidMessage(startBound, "SELECT pk FROM %s WHERE (a > 2 AND a > 0) OR b = 20");
+        assertInvalidMessage(endBound, "SELECT pk FROM %s WHERE (a < 2 AND a < 5) OR b = 20");
+    }
+
+    @Test
+    public void sameColumnPairNextToAnalyzedIndexIsRefused() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, a int, b int, c text)");
+        createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(b) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(c) USING 'sai' WITH OPTIONS = { 'case_sensitive' : false }");
+
+        String[] values = { "a", "d", "n", "x", "y", "z" };
+        for (int i = 1; i <= 6; i++)
+            execute("INSERT INTO %s (pk, a, b, c) VALUES (?, ?, ?, ?)", i, i, 10 * i, values[i - 1]);
+
+        // With a case insensitive index in the query, both pairs are refused over the native protocol at ONE
+        assertThatThrownBy(() -> executeNet(getDefaultVersion(), ConsistencyLevel.ONE, "SELECT pk FROM %s WHERE (a = 5 AND a = 6) OR c = 'nomatch'"))
+        .isInstanceOf(InvalidQueryException.class)
+        .hasMessageContaining("a cannot be restricted by more than one relation if it includes an Equal");
+        assertThatThrownBy(() -> executeNet(getDefaultVersion(), ConsistencyLevel.ONE, "SELECT pk FROM %s WHERE (c = 'x' AND c = 'y') OR b = 20"))
+        .isInstanceOf(InvalidQueryException.class)
+        .hasMessageContaining("c cannot be restricted by more than one relation if it includes an Equal");
+    }
+
+    @Test
+    public void sameColumnSlicesInOneBranchMerge() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, a int, b int, c text)");
+        createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(b) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(c) USING 'sai' WITH OPTIONS = { 'case_sensitive' : false }");
+
+        String[] values = { "a", "d", "n", "x", "y", "z" };
+        for (int i = 1; i <= 6; i++)
+            execute("INSERT INTO %s (pk, a, b, c) VALUES (?, ?, ?, ?)", i, i, 10 * i, values[i - 1]);
+
+        String interleaved = "SELECT pk FROM %s WHERE (a < 3 AND b = 20 AND a > 0) OR c = 'z'";
+        beforeAndAfterFlush(() -> {
+            // Guard. A lower and an upper bound on one column merge in either order
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (a > 0 AND a < 3) OR b = 20"),
+                                    row(1), row(2));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (a < 3 AND a > 0) OR b = 20"),
+                                    row(1), row(2));
+            assertRowsIgnoringOrder(execute(interleaved),
+                                    row(2), row(6));
+        });
+
+        // The merged slice takes the place of the first relation on a, lower bound first, and the
+        // second relation on a is not emitted again
+        SelectStatement select = (SelectStatement) QueryProcessor.getStatement(formatQuery(interleaved), ClientState.forInternalCalls());
+        ReadCommand command = (ReadCommand) select.getQuery(QueryOptions.DEFAULT, FBUtilities.nowInSeconds());
+        assertTrue(command.toCQLString(), command.toCQLString().contains("(a > 0 AND a < 3 AND b = 20)"));
+
+        // Each execution traces the merge. Control. A group with one relation per column traces nothing.
+        Session session = sessionNet();
+        String trace = getSingleTraceStatement(session, interleaved, "OR group merged");
+        assertNotNull(trace);
+        assertTrue(trace, trace.contains("merged 2 relations on column a"));
+        assertNull(getSingleTraceStatement(session, "SELECT pk FROM %s WHERE (a < 3 AND b = 20) OR c = 'z'", "OR group merged"));
+    }
+
+    @Test
+    public void sameColumnCollectionsInOneBranch() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, m map<text, int>, s set<int>, fm frozen<map<text, int>>, b int)");
+        createIndex("CREATE INDEX ON %s(KEYS(m)) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(ENTRIES(m)) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(s) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(FULL(fm)) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(b) USING 'sai'");
+
+        execute("INSERT INTO %s (pk, m, s, fm, b) VALUES (1, {'k': 1, 'j': 2}, {1, 2}, {'k': 1}, 10)");
+        execute("INSERT INTO %s (pk, m, s, fm, b) VALUES (2, {'k': 1}, {1}, {'k': 2}, 20)");
+        execute("INSERT INTO %s (pk, m, s, fm, b) VALUES (3, {'k': 2, 'j': 2}, {2, 3}, {'k': 1, 'j': 1}, 30)");
+
+        beforeAndAfterFlush(() -> {
+            // Guard. Map entries, set values, and keys with entries merge into one restriction, each one checked
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (m['k'] = 1 AND m['j'] = 2) OR b = 20"),
+                                    row(1), row(2));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (m['k'] = 1 AND m['k'] = 2) OR b = 20"),
+                                    row(2));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (s CONTAINS 1 AND s CONTAINS 2) OR b = 20"),
+                                    row(1), row(2));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (m CONTAINS KEY 'k' AND m['k'] = 1) OR b = 20"),
+                                    row(1), row(2));
+        });
+
+        // Two = on a frozen collection get the stock refusal
+        assertInvalidMessage("fm cannot be restricted by more than one relation if it includes an Equal",
+                             "SELECT pk FROM %s WHERE (fm = {'k': 1} AND fm = {'k': 2}) OR b = 20");
+
+        // Guard. With an index on the keys only, the entry relation needs filtering, as it does on its own
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, m map<text, int>, b int)");
+        createIndex("CREATE INDEX ON %s(KEYS(m)) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(b) USING 'sai'");
+
+        execute("INSERT INTO %s (pk, m, b) VALUES (1, {'k': 1, 'j': 2}, 10)");
+        execute("INSERT INTO %s (pk, m, b) VALUES (2, {'k': 1}, 20)");
+        execute("INSERT INTO %s (pk, m, b) VALUES (3, {'k': 2, 'j': 2}, 30)");
+
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
+                             "SELECT pk FROM %s WHERE (m CONTAINS KEY 'k' AND m['k'] = 1) OR b = 20");
+        beforeAndAfterFlush(() ->
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (m CONTAINS KEY 'k' AND m['k'] = 1) OR b = 20 ALLOW FILTERING"),
+                                    row(1), row(2)));
+    }
+
+    @Test
+    public void sameColumnPairIsRefusedOnTheFilteringPath() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, a int, b int)");
+
+        execute("INSERT INTO %s (pk, a, b) VALUES (1, 1, 10)");
+        execute("INSERT INTO %s (pk, a, b) VALUES (2, 2, 20)");
+        execute("INSERT INTO %s (pk, a, b) VALUES (5, 5, 50)");
+        execute("INSERT INTO %s (pk, a, b) VALUES (9, 9, 90)");
+
+        // Without any index the pair is refused too, so a query is valid or not whatever the indexes
+        assertInvalidMessage("a cannot be restricted by more than one relation if it includes an Equal",
+                             "SELECT pk FROM %s WHERE (a = 5 AND a > 0) OR b = 20 ALLOW FILTERING");
+
+        // Control. Two bounds on one column filter as one range
+        beforeAndAfterFlush(() ->
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (a > 0 AND a < 9) OR b = 20 ALLOW FILTERING"),
+                                    row(1), row(2), row(5)));
+    }
+
+    @Test
+    public void sameColumnPairInNestedGroups() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, a int, b int, c text)");
+        createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(b) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(c) USING 'sai' WITH OPTIONS = { 'case_sensitive' : false }");
+
+        String[] values = { "a", "d", "n", "x", "y", "z" };
+        for (int i = 1; i <= 6; i++)
+            execute("INSERT INTO %s (pk, a, b, c) VALUES (?, ?, ?, ?)", i, i, 10 * i, values[i - 1]);
+
+        // An AND group under an OR under an AND, and nested AND groups that flatten into one
+        assertInvalidMessage("a cannot be restricted by more than one relation if it includes an Equal",
+                             "SELECT pk FROM %s WHERE ((a = 5 AND a > 0) OR b = 20) AND c = 'z'");
+        assertInvalidMessage("a cannot be restricted by more than one relation if it includes an Equal",
+                             "SELECT pk FROM %s WHERE (a = 1 AND (a > 0 AND b = 20)) OR c = 'z'");
+
+        // Guard. Relations in different nodes never merge, as at the root
+        beforeAndAfterFlush(() -> {
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE a = 5 AND (a > 0 OR b = 20)"),
+                                    row(5));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (a > 0 AND (a = 5 OR b = 20)) OR c = 'z'"),
+                                    row(2), row(5), row(6));
+        });
+    }
+
+    @Test
+    public void analyzedRelationsInOneBranchMergeLikeTheRoot() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, body text, v int)");
+        createIndex("CREATE INDEX ON %s(body) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        createIndex("CREATE INDEX ON %s(v) USING 'sai'");
+
+        execute("INSERT INTO %s (pk, body, v) VALUES (1, 'Disk full on node 3', 1)");
+        execute("INSERT INTO %s (pk, body, v) VALUES (2, 'timeout after 30s', 2)");
+        execute("INSERT INTO %s (pk, body, v) VALUES (3, 'Connection timeout to db', 1)");
+        execute("INSERT INTO %s (pk, body, v) VALUES (4, 'Timeout', 3)");
+
+        // Guard. Two word searches, and a word search with a range, merge in one branch
+        beforeAndAfterFlush(() -> {
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (body MATCH 'timeout' AND body PHRASE 'after 30s') OR v = 3"),
+                                    row(2), row(4));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (body MATCH 'timeout' AND body > 'm') OR body MATCH 'disk' ALLOW FILTERING"),
+                                    row(1), row(2));
+        });
+
+        // Guard. = joins the word search and keeps the refusal it gets under UNSUPPORTED on its own
+        assertInvalidMessage(String.format(SingleColumnRestriction.EQRestriction.EQ_UNSUPPORTED_ON_ANALYZED_MESSAGE, "body"),
+                             "SELECT pk FROM %s WHERE (body MATCH 'timeout' AND body = 'disk') OR v = 1");
+        // Guard. The check of each relation comes before the merge
+        assertInvalidMessage("IN restrictions are not supported within OR expressions",
+                             "SELECT pk FROM %s WHERE (body MATCH 'timeout' AND body IN ('x')) OR v = 1");
+    }
+
+    @Test
+    public void sameColumnRefusalIsTraced() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, a int, b int)");
+        createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(b) USING 'sai'");
+
+        for (int i = 1; i <= 6; i++)
+            execute("INSERT INTO %s (pk, a, b) VALUES (?, ?, ?)", i, i, 10 * i);
+
+        // Preparing the refused query traces the refusal and names the column
+        TimeUUID refusedSession = Tracing.instance.newSession(Tracing.TraceType.QUERY);
+        try
+        {
+            assertInvalidMessage("a cannot be restricted by more than one relation if it includes an Equal",
+                                 "SELECT pk FROM %s WHERE (a = 5 AND a > 0) OR b = 20");
+        }
+        finally
+        {
+            Tracing.instance.stopSession();
+        }
+        waitForTracingEvents();
+
+        List<String> refusals = new ArrayList<>();
+        for (UntypedResultSet.Row event : execute("SELECT activity FROM system_traces.events WHERE session_id = " + refusedSession))
+        {
+            if (event.getString("activity").startsWith("OR group refused"))
+                refusals.add(event.getString("activity"));
+        }
+        assertEquals(List.of("OR group refused for several relations on column a"), refusals);
+
+        // Control. A merge that succeeds traces no refusal
+        TimeUUID mergedSession = Tracing.instance.newSession(Tracing.TraceType.QUERY);
+        try
+        {
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (a > 0 AND a < 3) OR b = 20"), row(1), row(2));
+        }
+        finally
+        {
+            Tracing.instance.stopSession();
+        }
+        waitForTracingEvents();
+
+        List<String> mergedRefusals = new ArrayList<>();
+        for (UntypedResultSet.Row event : execute("SELECT activity FROM system_traces.events WHERE session_id = " + mergedSession))
+        {
+            if (event.getString("activity").startsWith("OR group refused"))
+                mergedRefusals.add(event.getString("activity"));
+        }
+        assertEquals(List.of(), mergedRefusals);
     }
 }

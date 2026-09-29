@@ -249,8 +249,8 @@ usual rule for `IN`: refused above `ONE` when replicas must be reconciled, accep
 `LOCAL_ONE`. Above `ONE`, a word search joined with a range or `IN` triggers the
 `intersect_filtering_query` guardrail when the column is static or another regular column is also
 restricted: a warning by default, a refusal when `intersect_filtering_query_enabled` is false.
-Inside an `OR` branch each condition is checked on its own, with the same result. `IN` stays
-refused inside `OR`.
+Inside an `OR` branch the conditions of one AND group on one column combine by the same rules,
+with the same result. `IN` stays refused inside `OR`.
 
 ## `=` on analyzed columns
 
@@ -336,6 +336,16 @@ its first answer can time the query out. Each request is checked against
 page the query, raise the replica filtering protection threshold, read at `LOCAL_ONE`, or add
 an index. The `intersect_filtering_query` guardrail warns about these queries.
 
+Several conditions on one column in one AND group of an `OR` follow the rules Cassandra applies
+without `OR`, whatever the indexes, with or without ALLOW FILTERING. Two range bounds on opposite
+sides merge into one range, so `(a > 0 AND a < 3) OR b = 20` is accepted. A pair Cassandra refuses
+without `OR` is refused with the same error: `(a = 5 AND a > 0) OR b = 20` gets
+`a cannot be restricted by more than one relation if it includes an Equal`, and
+`(a > 2 AND a > 0) OR b = 20` gets `More than one restriction was found for the start bound on a`.
+`CONTAINS`, `CONTAINS KEY` and `m['key'] = value` on one collection combine as without `OR`, and each
+needs its own index to avoid ALLOW FILTERING. Conditions in different groups never merge:
+`a = 5 AND (a > 0 OR b = 20)` and `a < 2 OR a > 17` are accepted.
+
 Static columns may appear inside `OR`. One boundary case to know: a partition whose only
 content is a matching static row (no regular rows at all) produces no result row for a
 disjunction that also restricts regular columns, on the index path and the filtering path
@@ -371,6 +381,23 @@ With tracing enabled these queries emit events at each decision point:
   memtable and sstable segments
 * post-filter counts, rows matched of rows checked, on replicas and on the coordinator
   during replica filtering protection
+* an `OR` group refused for several conditions on one column, naming the column, when the
+  statement is prepared
+* the number of conditions merged on a column of an `OR` group, on each execution
+* on a replica, the column and number of expressions on one column kept apart instead of
+  folded into one range
+
+## Metrics
+
+`TotalSameColumnExpressionsKeptApart` is a counter in the storage-attached index table query
+metrics, JMX name
+`org.apache.cassandra.metrics:type=StorageAttachedIndex,keyspace=<ks>,table=<t>,scope=TableQueryMetrics,name=TotalSameColumnExpressionsKeptApart`.
+It counts, on each replica, each `=` or range expression on a column beyond the first that an index
+query kept apart instead of folding it into one range, summed per replica read command. Each page
+and each range split is one command. It stays 0 while every coordinator merges the conditions of an
+`OR` group, and a nonzero value means a coordinator sent such conditions unmerged, see
+[Cluster upgrade rule](#cluster-upgrade-rule). To read it:
+`nodetool sjk mx -mg -b "org.apache.cassandra.metrics:type=StorageAttachedIndex,keyspace=ks,table=t,scope=TableQueryMetrics,name=TotalSameColumnExpressionsKeptApart" -f Count`.
 
 ## Not yet available
 

@@ -50,6 +50,7 @@ public class QueryContext
     public long partitionsRead = 0;
     public long rowsFiltered = 0;
     public long rowsMatched = 0;
+    public long sameColumnExpressionsKeptApart = 0;
 
     public long trieSegmentsHit = 0;
     public long triePostingsSkips = 0;

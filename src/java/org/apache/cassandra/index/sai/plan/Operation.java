@@ -22,9 +22,11 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.BiFunction;
 
@@ -300,6 +302,61 @@ public class Operation
     }
 
     /**
+     * Builds the index expressions of an AND node under an OR. The relations are split into rounds, each
+     * built by {@link #buildIndexExpressions}, so that its fold only ever joins a slice to a range whose
+     * bound on that side is unset. = and a second bound on one side get an expression of their own, and
+     * the node intersects them, which is the AND the query means. Trees from a coordinator that merges the
+     * relations of an OR branch need one round, except for two map entries on one column, which keep an
+     * expression each in any round.
+     */
+    private static Expressions buildIndexExpressionsKeptApart(QueryController queryController, List<RowFilter.Expression> expressions)
+    {
+        List<RowFilter.Expression> sorted = new ArrayList<>(expressions);
+        sorted.sort((a, b) -> {
+            int cmp = a.column().compareTo(b.column());
+            return cmp == 0 ? -Integer.compare(getPriority(a.operator()), getPriority(b.operator())) : cmp;
+        });
+
+        // Per round, per column, what the fold has taken: 1 an equality, 2 a lower bound, 4 an upper bound.
+        // The 1 bit a slice needs is redundant, because an equality also sets 2 and 4.
+        List<List<RowFilter.Expression>> rounds = new ArrayList<>();
+        List<Map<ColumnMetadata, Integer>> taken = new ArrayList<>();
+        for (RowFilter.Expression expression : sorted)
+        {
+            Operator operator = expression.operator();
+            boolean lower = operator == Operator.GT || operator == Operator.GTE;
+            boolean upper = operator == Operator.LT || operator == Operator.LTE;
+            int needs = lower ? 1 | 2 : upper ? 1 | 4 : operator == Operator.EQ ? 1 | 2 | 4 : 0;
+            int sets = lower ? 2 : upper ? 4 : needs;
+
+            int round = 0;
+            while (round < rounds.size() && (taken.get(round).getOrDefault(expression.column(), 0) & needs) != 0)
+                round++;
+            if (round == rounds.size())
+            {
+                rounds.add(new ArrayList<>());
+                taken.add(new HashMap<>());
+            }
+            rounds.get(round).add(expression);
+            taken.get(round).merge(expression.column(), sets, (x, y) -> x | y);
+        }
+
+        if (rounds.size() <= 1)
+            return buildIndexExpressions(queryController, expressions);
+
+        ListMultimap<ColumnMetadata, Expression> analyzed = ArrayListMultimap.create();
+        Set<ColumnMetadata> unindexedColumns = new HashSet<>();
+        for (List<RowFilter.Expression> round : rounds)
+        {
+            Expressions built = buildIndexExpressions(queryController, round);
+            for (ColumnMetadata column : built.columns())
+                analyzed.putAll(column, built.expressionsFor(column));
+            unindexedColumns.addAll(built.unindexedColumns);
+        }
+        return new Expressions(analyzed, unindexedColumns.isEmpty() ? Collections.emptySet() : unindexedColumns);
+    }
+
+    /**
      * Traces how the query analyzer tokenized the queried value, one event per analyzed expression.
      */
     private static void traceQueryTokens(StorageAttachedIndex index, RowFilter.Expression expression, List<AnalyzedToken> tokens)
@@ -388,10 +445,50 @@ public class Operation
     static KeyRangeIterator buildIterator(QueryController controller)
     {
         Node node = Node.buildTree(controller.indexFilter()).analyzeTree(controller);
+        // Counted here only, once per replica read command. The filter tree build analyzes the same tree.
+        controller.queryContext.sameColumnExpressionsKeptApart += countSameColumnExpressions(node);
         // Scoped to disjunctions so queries without OR keep their existing trace output
         if (Tracing.isTracing() && controller.indexFilter().containsDisjunction())
             Tracing.trace("Executing index query tree {}", node.treeDescription());
         return node.rangeIterator(controller);
+    }
+
+    /**
+     * Counts, per node and column, the = and range expressions beyond the first, which
+     * {@link #buildIndexExpressionsKeptApart} kept apart, and traces each such column. Only a tree
+     * from a coordinator that does not merge the relations of an OR branch has them. Non frozen
+     * collections are skipped, each of their map entries is an expression of its own.
+     */
+    private static long countSameColumnExpressions(Node node)
+    {
+        long count = 0;
+        if (node.expressions != null)
+        {
+            for (ColumnMetadata column : node.expressions.columns())
+            {
+                if (column.type.isCollection() && column.type.isMultiCell())
+                    continue;
+
+                int kept = 0;
+                for (Expression expression : node.expressions.expressionsFor(column))
+                {
+                    if (expression.getIndexOperator() == Expression.IndexOperator.EQ
+                        || expression.getIndexOperator() == Expression.IndexOperator.RANGE)
+                        kept++;
+                }
+
+                if (kept > 1)
+                {
+                    count += kept - 1;
+                    Tracing.trace("Index query kept {} expressions on column {} apart instead of folding them", kept, column.name);
+                }
+            }
+        }
+
+        for (Node child : node.children())
+            count += countSameColumnExpressions(child);
+
+        return count;
     }
 
     /**
@@ -489,7 +586,12 @@ public class Operation
             }
 
             for (RowFilter.FilterElement child : element.children())
-                node.add(buildTree(child, needsReconciliation));
+            {
+                Node childNode = buildTree(child, needsReconciliation);
+                if (node instanceof OrNode && childNode instanceof AndNode)
+                    ((AndNode) childNode).underDisjunction = true;
+                node.add(childNode);
+            }
 
             return node;
         }
@@ -592,6 +694,12 @@ public class Operation
          */
         private final boolean strict;
 
+        /**
+         * Whether this node is an AND group under an OR, whose relations on one column are kept apart
+         * instead of folded, see {@link #buildIndexExpressionsKeptApart}.
+         */
+        boolean underDisjunction;
+
         AndNode(boolean strict)
         {
             this.strict = strict;
@@ -600,6 +708,12 @@ public class Operation
         @Override
         public void analyze(List<RowFilter.Expression> expressionList, QueryController controller)
         {
+            if (underDisjunction)
+            {
+                expressions = buildIndexExpressionsKeptApart(controller, expressionList);
+                return;
+            }
+
             expressions = buildIndexExpressions(controller, expressionList);
         }
 
