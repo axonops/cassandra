@@ -259,6 +259,11 @@ public class IndexTermType
             case EQ:
                 multiExpression = isNonFrozenCollection();
                 break;
+            // each analyzed relation keeps its own expression, also when it has no index
+            case ANALYZER_MATCHES:
+            case PHRASE:
+            case ANALYZER_MATCHES_KEY:
+            case PHRASE_KEY:
             case CONTAINS:
             case CONTAINS_KEY:
                 multiExpression = true;

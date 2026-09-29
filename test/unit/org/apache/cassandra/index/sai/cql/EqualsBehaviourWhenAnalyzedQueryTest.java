@@ -17,13 +17,19 @@
  */
 package org.apache.cassandra.index.sai.cql;
 
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import org.junit.Before;
 import org.junit.Test;
 
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.restrictions.SingleColumnRestriction;
+import org.apache.cassandra.cql3.statements.SelectStatement;
 import org.apache.cassandra.index.sai.SAITester;
+import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.ClientWarn;
 
 import static org.junit.Assert.assertEquals;
@@ -126,5 +132,61 @@ public class EqualsBehaviourWhenAnalyzedQueryTest extends SAITester
             assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body = 'quick fox'"), row(1));
             assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body = 'quick'"));
         });
+    }
+
+    @Test
+    public void equalsJoinsAnalyzedRelations() throws Throwable
+    {
+        createTable("CREATE TABLE %s (id int PRIMARY KEY, body text)");
+        createIndex("CREATE INDEX ON %s(body) USING 'sai' WITH OPTIONS = " +
+                    "{ 'index_analyzer' : 'standard', 'equals_behaviour_when_analyzed' : 'MATCH' }");
+
+        execute("INSERT INTO %s (id, body) VALUES (1, 'the quick fox')");
+        execute("INSERT INTO %s (id, body) VALUES (2, 'lazy dog')");
+        execute("INSERT INTO %s (id, body) VALUES (3, 'quick dog')");
+        execute("INSERT INTO %s (id, body) VALUES (4, 'lazy fox')");
+
+        beforeAndAfterFlush(() -> {
+            // = is one more MATCH relation in either order, and the client gets one warning
+            for (String query : new String[]{ "SELECT id FROM %s WHERE body = 'fox' AND body MATCH 'quick'",
+                                              "SELECT id FROM %s WHERE body MATCH 'quick' AND body = 'fox'" })
+            {
+                ClientWarn.instance.captureWarnings();
+                assertRowsIgnoringOrder(execute(query), row(1));
+                List<String> warnings = ClientWarn.instance.getWarnings();
+                assertNotNull(query, warnings);
+                assertEquals(warnings.toString(), 1, warnings.stream().filter(w -> w.contains("= behaves like the MATCH operator")).count());
+                ClientWarn.instance.resetWarnings();
+            }
+            assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body = ? AND body MATCH ?", "fox", "quick"), row(1));
+        });
+
+        // A function in the = term is one of the statement's functions
+        String function = "SELECT id FROM %s WHERE body = blobAsText(0x666f78) AND body MATCH 'quick'";
+        SelectStatement select = (SelectStatement) QueryProcessor.getStatement(formatQuery(function), ClientState.forInternalCalls());
+        Set<String> functions = new HashSet<>();
+        for (Function f : select.getFunctions())
+            functions.add(f.name().name);
+        assertTrue(functions.toString(), functions.contains("blobastext"));
+        assertRowsIgnoringOrder(execute(function), row(1));
+
+        // A second stock relation merges with the = as it does without the word search
+        String equalText = "body cannot be restricted by more than one relation if it includes an Equal";
+        assertInvalidMessage(equalText, "SELECT id FROM %s WHERE body = 'a' AND body MATCH 'x' AND body = 'b'");
+        assertInvalidMessage(equalText, "SELECT id FROM %s WHERE body = 'a' AND body MATCH 'x' AND body > 'a' ALLOW FILTERING");
+        assertInvalidMessage(equalText, "SELECT id FROM %s WHERE body MATCH 'x' AND body = 'a' AND body > 'a' ALLOW FILTERING");
+
+        // Under UNSUPPORTED, = next to MATCH is refused as = alone is
+        createTable("CREATE TABLE %s (id int PRIMARY KEY, body text)");
+        createIndex("CREATE INDEX ON %s(body) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+
+        execute("INSERT INTO %s (id, body) VALUES (1, 'the quick fox')");
+
+        String unsupported = String.format(SingleColumnRestriction.EQRestriction.EQ_UNSUPPORTED_ON_ANALYZED_MESSAGE, "body");
+        assertInvalidMessage(unsupported, "SELECT id FROM %s WHERE body = 'fox' AND body MATCH 'quick'");
+        assertInvalidMessage(unsupported, "SELECT id FROM %s WHERE body MATCH 'quick' AND body = 'fox'");
+        // an IN list written with one value is parsed as =
+        assertInvalidMessage(unsupported, "SELECT id FROM %s WHERE body IN ('fox') AND body MATCH 'quick'");
+        assertInvalidMessage(unsupported, "SELECT id FROM %s WHERE body MATCH 'quick' AND body IN ('fox')");
     }
 }

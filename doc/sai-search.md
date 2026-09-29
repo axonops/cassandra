@@ -209,6 +209,49 @@ column. Without an analyzed index on `KEYS(column)` they are refused with an err
 that index, also when the map has an analyzed index on its values. `CONTAINS KEY` compares
 whole keys, through a plain index on `KEYS(column)`.
 
+## Several conditions on one column
+
+Any number of `MATCH`, `PHRASE`, `MATCH KEY` and `PHRASE KEY` conditions on one column can be
+joined with AND, and every one of them must match. Each is served by its analyzed index, so
+no ALLOW FILTERING is needed:
+
+    SELECT * FROM ks.articles WHERE body MATCH 'cassandra' AND body PHRASE 'rolling upgrade';
+    SELECT * FROM ks.events WHERE attrs MATCH KEY 'error' AND attrs MATCH 'disk';
+
+`=` under `equals_behaviour_when_analyzed` `MATCH` joins as one more `MATCH` condition. Under
+`UNSUPPORTED` the query is refused as for `=` alone. `CONTAINS`, `CONTAINS KEY` and
+`m['key'] = 'value'` join when another index answers them. With a plain storage-attached index no
+ALLOW FILTERING is needed, with a legacy secondary index it is.
+
+A range or `IN` on the same column also joins. The analyzed index finds the rows, then the range
+or `IN` is checked on the whole stored value, as Cassandra checks it without an index, so
+ALLOW FILTERING is required. Take `logs (id int PRIMARY KEY, body text)` with a `standard` analyzer
+and the rows 1 'Disk full on node 3', 2 'timeout after 30s', 3 'Connection timeout to db' and
+4 'Timeout':
+
+| Query | Rows |
+|---|---|
+| `body MATCH 'timeout'` | 2, 3, 4 |
+| `body > 'm' ALLOW FILTERING` | 2 |
+| `body MATCH 'timeout' AND body > 'm' ALLOW FILTERING` | 2 |
+| `body MATCH 'timeout' AND body >= 'T' AND body < 'U' ALLOW FILTERING` | 4 |
+| `body MATCH 'timeout' AND body IN ('Timeout', 'Disk full') ALLOW FILTERING` | 4 |
+
+An `IN` list written with one value is parsed as `=`, so the rules for `=` above apply to it. A bind
+marker `IN ?` stays an `IN` whatever the list length.
+
+A range compares raw bytes, so case matters: 'Timeout' sorts before 'm' and
+'timeout after 30s' after it. Two stock conditions on the column combine by the usual rules, for
+example two range bounds merge and `=` next to a range is refused.
+
+An `IN` next to a condition on another regular column, or an `IN` on a static column, follows the
+usual rule for `IN`: refused above `ONE` when replicas must be reconciled, accepted at `ONE` and
+`LOCAL_ONE`. Above `ONE`, a word search joined with a range or `IN` triggers the
+`intersect_filtering_query` guardrail when the column is static or another regular column is also
+restricted: a warning by default, a refusal when `intersect_filtering_query_enabled` is false.
+Inside an `OR` branch each condition is checked on its own, with the same result. `IN` stays
+refused inside `OR`.
+
 ## `=` on analyzed columns
 
 The `equals_behaviour_when_analyzed` index option decides what `=` means on a column with

@@ -265,4 +265,20 @@ public class PhraseQueryTest extends SAITester
         assertNotNull(trace);
         assertTrue(trace, trace.contains("matched 1 of 2 candidates for 2 tokens"));
     }
+
+    @Test
+    public void severalPhrasesOnACollectionMatchWithinElements() throws Throwable
+    {
+        createTable("CREATE TABLE %s (id int PRIMARY KEY, val list<text>)");
+        createIndex("CREATE INDEX ON %s(val) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+
+        execute("INSERT INTO %s (id, val) VALUES (1, ['quick brown', 'fox jumps'])");
+        execute("INSERT INTO %s (id, val) VALUES (2, ['quick brown fox'])");
+
+        beforeAndAfterFlush(() -> {
+            // each phrase sits inside one element, and each relation may use a different element
+            assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE val PHRASE 'quick brown' AND val PHRASE 'fox jumps'"), row(1));
+            assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE val PHRASE 'quick brown' AND val PHRASE 'brown fox'"), row(2));
+        });
+    }
 }

@@ -543,4 +543,34 @@ public class DisjunctionQueryTest extends SAITester
         }
         assertEquals(ImmutableSet.of(0), kept);
     }
+
+    @Test
+    public void wordSearchWithStockFilterAndOr() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, body text, v int)");
+        createIndex("CREATE INDEX ON %s(body) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        createIndex("CREATE INDEX ON %s(v) USING 'sai'");
+
+        execute("INSERT INTO %s (pk, body, v) VALUES (1, 'Disk full on node 3', 1)");
+        execute("INSERT INTO %s (pk, body, v) VALUES (2, 'timeout after 30s', 2)");
+        execute("INSERT INTO %s (pk, body, v) VALUES (3, 'Connection timeout to db', 1)");
+        execute("INSERT INTO %s (pk, body, v) VALUES (4, 'Timeout', 3)");
+
+        beforeAndAfterFlush(() -> {
+            // A word search and a range on one column next to an OR child, in both orders
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE body > 'm' AND body MATCH 'timeout' AND (v = 1 OR v = 2) ALLOW FILTERING"),
+                                    row(2));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE body MATCH 'timeout' AND body > 'm' AND (v = 1 OR v = 2) ALLOW FILTERING"),
+                                    row(2));
+            // Two word searches on one column next to an OR child need no ALLOW FILTERING
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE body MATCH 'timeout' AND body PHRASE 'after 30s' AND (v = 1 OR v = 2)"),
+                                    row(2));
+            // Relations inside one OR branch are never merged
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (body MATCH 'timeout' AND body > 'm') OR body MATCH 'disk' ALLOW FILTERING"),
+                                    row(1), row(2));
+            // A root IN next to an OR child is checked after the index
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE body IN ('Timeout', 'Disk full') AND (body MATCH 'timeout' OR body MATCH 'disk') ALLOW FILTERING"),
+                                    row(4));
+        });
+    }
 }

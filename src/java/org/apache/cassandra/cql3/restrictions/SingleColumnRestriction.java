@@ -233,6 +233,8 @@ public abstract class SingleColumnRestriction implements SingleRestriction
         @Override
         public SingleRestriction doMergeWith(SingleRestriction otherRestriction)
         {
+            if (otherRestriction instanceof AnalyzerMatchesRestriction)
+                return ((AnalyzerMatchesRestriction) otherRestriction).absorb(this);
             throw invalidRequest("%s cannot be restricted by more than one relation if it includes an Equal", columnDef.name);
         }
 
@@ -259,6 +261,8 @@ public abstract class SingleColumnRestriction implements SingleRestriction
         @Override
         public final SingleRestriction doMergeWith(SingleRestriction otherRestriction)
         {
+            if (otherRestriction instanceof AnalyzerMatchesRestriction)
+                return ((AnalyzerMatchesRestriction) otherRestriction).absorb(this);
             throw invalidRequest("%s cannot be restricted by more than one relation if it includes a IN", columnDef.name);
         }
 
@@ -429,6 +433,8 @@ public abstract class SingleColumnRestriction implements SingleRestriction
         @Override
         public SingleRestriction doMergeWith(SingleRestriction otherRestriction)
         {
+            if (otherRestriction instanceof AnalyzerMatchesRestriction)
+                return ((AnalyzerMatchesRestriction) otherRestriction).absorb(this);
             checkTrue(otherRestriction.isSlice(),
                       "Column \"%s\" cannot be restricted by both an equality and an inequality relation",
                       columnDef.name);
@@ -522,6 +528,8 @@ public abstract class SingleColumnRestriction implements SingleRestriction
         @Override
         public SingleRestriction doMergeWith(SingleRestriction otherRestriction)
         {
+            if (otherRestriction instanceof AnalyzerMatchesRestriction)
+                return ((AnalyzerMatchesRestriction) otherRestriction).absorb(this);
             checkTrue(otherRestriction.isContains(),
                       "Collection column %s can only be restricted by CONTAINS, CONTAINS KEY, or map-entry equality",
                       columnDef.name);
@@ -856,23 +864,49 @@ public abstract class SingleColumnRestriction implements SingleRestriction
      * Restriction for the analyzed operators, {@code MATCH} and {@code PHRASE}. Both need a
      * storage-attached index with an {@code index_analyzer} on the column, and both are gated on
      * every node in the cluster running this build, because a vanilla replica cannot evaluate them.
+     * <p>
+     * Every analyzed relation on the column is held here and all of them must match. One stock
+     * relation on the same column (=, CONTAINS, a slice or IN) can be held too. The analyzed index
+     * narrows the rows and the stock relation is checked as it would be without the word search.
      */
     public static final class AnalyzerMatchesRestriction extends SingleColumnRestriction
     {
-        private final Operator operator;
-        private final Term value;
+        private final List<Operator> operators;
+        private final List<Term> values;
+        private final SingleColumnRestriction absorbed;
 
         public AnalyzerMatchesRestriction(ColumnMetadata columnDef, Operator operator, Term value)
         {
+            this(columnDef, List.of(operator), List.of(value), null);
+        }
+
+        private AnalyzerMatchesRestriction(ColumnMetadata columnDef,
+                                           List<Operator> operators,
+                                           List<Term> values,
+                                           SingleColumnRestriction absorbed)
+        {
             super(columnDef);
-            this.operator = operator;
-            this.value = value;
+            this.operators = List.copyOf(operators);
+            this.values = List.copyOf(values);
+            this.absorbed = absorbed;
+        }
+
+        /**
+         * Adds a stock relation on the same column. A second stock relation merges with the first one
+         * through the stock rules, the earlier relation first.
+         */
+        SingleRestriction absorb(SingleColumnRestriction stock)
+        {
+            SingleColumnRestriction merged = absorbed == null ? stock : (SingleColumnRestriction) absorbed.mergeWith(stock);
+            return new AnalyzerMatchesRestriction(columnDef, operators, values, merged);
         }
 
         @Override
         public void addFunctionsTo(List<Function> functions)
         {
-            value.addFunctionsTo(functions);
+            Terms.addFunctions(values, functions);
+            if (absorbed != null)
+                absorbed.addFunctionsTo(functions);
         }
 
         @Override
@@ -898,12 +932,19 @@ public abstract class SingleColumnRestriction implements SingleRestriction
                                    IndexRegistry indexRegistry,
                                    QueryOptions options)
         {
-            ClusterVersionGate.checkClusterSupports("The " + operator + " operator");
+            if (absorbed != null)
+                absorbed.addToRowFilter(filter, indexRegistry, options);
 
-            RowFilter.SimpleExpression expression = filter.add(columnDef, operator, value.bindAndGet(options));
-            indexRegistry.getBestIndexFor(expression)
-                         .orElseThrow(() -> invalidRequest("%s is only supported on columns indexed with an index_analyzer",
-                                                           expression));
+            for (int i = 0; i < operators.size(); i++)
+            {
+                Operator operator = operators.get(i);
+                ClusterVersionGate.checkClusterSupports("The " + operator + " operator");
+
+                RowFilter.SimpleExpression expression = filter.add(columnDef, operator, values.get(i).bindAndGet(options));
+                indexRegistry.getBestIndexFor(expression)
+                             .orElseThrow(() -> invalidRequest("%s is only supported on columns indexed with an index_analyzer",
+                                                               expression));
+            }
         }
 
         @Override
@@ -915,13 +956,41 @@ public abstract class SingleColumnRestriction implements SingleRestriction
         @Override
         public String toString()
         {
-            return operator.toString();
+            StringBuilder builder = new StringBuilder();
+            for (Operator operator : operators)
+            {
+                if (builder.length() > 0)
+                    builder.append(" AND ");
+                builder.append(operator);
+            }
+            if (absorbed != null)
+                builder.append(" AND ").append(absorbed);
+            return builder.toString();
         }
 
         @Override
         public SingleRestriction doMergeWith(SingleRestriction otherRestriction)
         {
-            throw invalidRequest("%s cannot be restricted by more than one relation if it includes a %s", columnDef.name, operator);
+            if (otherRestriction instanceof AnalyzerMatchesRestriction)
+            {
+                AnalyzerMatchesRestriction other = (AnalyzerMatchesRestriction) otherRestriction;
+                List<Operator> mergedOperators = new ArrayList<>(operators);
+                mergedOperators.addAll(other.operators);
+                List<Term> mergedValues = new ArrayList<>(values);
+                mergedValues.addAll(other.values);
+                SingleColumnRestriction mergedAbsorbed = absorbed == null ? other.absorbed
+                                                       : other.absorbed == null ? absorbed
+                                                       : (SingleColumnRestriction) absorbed.mergeWith(other.absorbed);
+                return new AnalyzerMatchesRestriction(columnDef, mergedOperators, mergedValues, mergedAbsorbed);
+            }
+
+            if (otherRestriction instanceof EQRestriction
+                || otherRestriction instanceof ContainsRestriction
+                || otherRestriction instanceof SliceRestriction
+                || otherRestriction instanceof INRestriction)
+                return absorb((SingleColumnRestriction) otherRestriction);
+
+            throw invalidRequest("%s cannot be restricted by more than one relation if it includes a %s", columnDef.name, operators.get(0));
         }
 
         @Override
@@ -929,7 +998,32 @@ public abstract class SingleColumnRestriction implements SingleRestriction
         {
             // Only a storage-attached index can support the analyzed operators. Older index
             // implementations have operator switches that predate them, so they are not asked.
-            return index instanceof StorageAttachedIndex && index.supportsExpression(columnDef, operator);
+            if (index instanceof StorageAttachedIndex)
+            {
+                for (Operator operator : operators)
+                {
+                    if (index.supportsExpression(columnDef, operator))
+                        return true;
+                }
+            }
+            return absorbed != null && absorbed.isSupportedBy(index);
+        }
+
+        @Override
+        public boolean needsFiltering(Index.Group indexGroup)
+        {
+            // Every analyzed relation needs its own index in the group. The stock relation keeps its own
+            // rule, so a slice or IN, which no analyzed index answers, needs filtering.
+            for (Operator operator : operators)
+            {
+                boolean served = false;
+                for (Index index : indexGroup.getIndexes())
+                    served |= index instanceof StorageAttachedIndex && index.supportsExpression(columnDef, operator);
+
+                if (!served)
+                    return true;
+            }
+            return absorbed != null && absorbed.needsFiltering(indexGroup);
         }
     }
 

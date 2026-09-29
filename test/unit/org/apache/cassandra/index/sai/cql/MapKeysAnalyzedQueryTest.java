@@ -301,4 +301,64 @@ public class MapKeysAnalyzedQueryTest extends SAITester
         assertTrue(trace, trace.contains("error@0"));
         assertRows(execute("SELECT pk FROM %s WHERE scores MATCH KEY 'error'"), row(1));
     }
+
+    @Test
+    public void keyAndValueRelationsOnOneMapAllMatch() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, attrs map<text, text>)");
+        createIndex("CREATE INDEX ON %s(KEYS(attrs)) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        createIndex("CREATE INDEX ON %s(VALUES(attrs)) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+
+        execute("INSERT INTO %s (pk, attrs) VALUES (1, {'error code': 'disk full', 'owner': 'ops team'})");
+        execute("INSERT INTO %s (pk, attrs) VALUES (2, {'warning': 'error code seen'})");
+
+        beforeAndAfterFlush(this::assertKeyAndValueRelations);
+
+        compact();
+        waitForCompactionsFinished();
+        assertKeyAndValueRelations();
+    }
+
+    private void assertKeyAndValueRelations() throws Throwable
+    {
+        // the index on the keys and the index on the values each serve their relations, no ALLOW FILTERING
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE attrs MATCH KEY 'error' AND attrs MATCH 'disk'"), row(1));
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE attrs PHRASE KEY 'error code' AND attrs PHRASE 'error code'"));
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE attrs MATCH KEY 'owner' AND attrs PHRASE 'ops team'"), row(1));
+    }
+
+    @Test
+    public void containsJoinsAnalyzedRelations() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, a map<text, text>, b map<text, text>)");
+        createIndex("CREATE INDEX ON %s(KEYS(a)) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(ENTRIES(a)) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(VALUES(a)) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        createIndex("CREATE INDEX ON %s(VALUES(b)) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(KEYS(b)) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+
+        execute("INSERT INTO %s (pk, a, b) VALUES (1, {'owner': 'ops team', 'error code': 'disk full'}, {'error code': 'disk full'})");
+        execute("INSERT INTO %s (pk, a, b) VALUES (2, {'owner': 'dev team'}, {'error log': 'disk ok'})");
+        execute("INSERT INTO %s (pk, a, b) VALUES (3, {'status': 'ops team'}, {'warning': 'disk full'})");
+        execute("INSERT INTO %s (pk, a) VALUES (4, {'owner': 'ops lead'})");
+
+        beforeAndAfterFlush(this::assertContainsAndAnalyzedRelations);
+
+        compact();
+        waitForCompactionsFinished();
+        assertContainsAndAnalyzedRelations();
+    }
+
+    private void assertContainsAndAnalyzedRelations() throws Throwable
+    {
+        // CONTAINS, CONTAINS KEY and map entry equality compare whole values and keys through the plain
+        // indexes, the word search runs on the analyzed index, in either order and with no ALLOW FILTERING
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE a CONTAINS KEY 'owner' AND a MATCH 'ops'"), row(1), row(4));
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE a MATCH 'ops' AND a CONTAINS KEY 'owner'"), row(1), row(4));
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE a CONTAINS KEY 'owner' AND a MATCH 'ops' AND a CONTAINS KEY 'error code'"), row(1));
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE a['owner'] = 'ops team' AND a MATCH 'team'"), row(1));
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE a MATCH 'team' AND a['owner'] = 'ops team'"), row(1));
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE b CONTAINS 'disk full' AND b MATCH KEY 'error'"), row(1));
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE b MATCH KEY 'error' AND b CONTAINS 'disk full'"), row(1));
+    }
 }

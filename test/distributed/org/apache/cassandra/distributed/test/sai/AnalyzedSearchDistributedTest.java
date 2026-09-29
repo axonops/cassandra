@@ -26,16 +26,19 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import com.google.common.util.concurrent.Uninterruptibles;
+import org.assertj.core.api.Assertions;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.test.TestBaseImpl;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.ClusterVersionGate;
+import org.apache.cassandra.index.sai.plan.StorageAttachedIndexQueryPlan;
 import org.apache.cassandra.service.StorageService;
 
 import static org.junit.Assert.assertEquals;
@@ -199,6 +202,85 @@ public class AnalyzedSearchDistributedTest extends TestBaseImpl
         // ...and a predicate the merged row does not satisfy stays unmatched
         assertEquals(0, quorumCount("SELECT pk FROM %s.partial WHERE a MATCH 'quick' AND b MATCH 'cat'"));
         assertEquals(0, quorumCount("SELECT pk FROM %s.partial WHERE a PHRASE 'fox brown' AND b PHRASE 'sleepy dog'"));
+    }
+
+    @Test
+    public void severalRelationsAreResolvedByReanalysis()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.diverged_several (pk int PRIMARY KEY, body text) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX diverged_several_idx ON %s.diverged_several(body) USING 'sai' " +
+                                          "WITH OPTIONS = { 'index_analyzer' : 'standard' }"));
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.diverged_several_static (pk int, ck int, s text static, PRIMARY KEY (pk, ck)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX diverged_several_static_idx ON %s.diverged_several_static(s) USING 'sai' " +
+                                          "WITH OPTIONS = { 'index_analyzer' : 'standard' }"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        int pk = 0;
+        List<Integer> replicas = replicaNodesFor(pk);
+        assertEquals(2, replicas.size());
+
+        // One replica indexed a stale 'quick brown fox', the other holds the newer 'lazy brown dog'
+        CLUSTER.get(replicas.get(0)).executeInternal(withKeyspace("INSERT INTO %s.diverged_several (pk, body) VALUES (?, ?) USING TIMESTAMP 1"),
+                                                     pk, "quick brown fox");
+        CLUSTER.get(replicas.get(1)).executeInternal(withKeyspace("INSERT INTO %s.diverged_several (pk, body) VALUES (?, ?) USING TIMESTAMP 2"),
+                                                     pk, "lazy brown dog");
+        CLUSTER.get(replicas.get(0)).executeInternal(withKeyspace("INSERT INTO %s.diverged_several_static (pk, ck, s) VALUES (?, 1, ?) USING TIMESTAMP 1"),
+                                                     pk, "quick brown fox");
+        CLUSTER.get(replicas.get(1)).executeInternal(withKeyspace("INSERT INTO %s.diverged_several_static (pk, ck, s) VALUES (?, 1, ?) USING TIMESTAMP 2"),
+                                                     pk, "lazy brown dog");
+
+        // Every relation is checked again on the merged newest value
+        assertEquals(0, quorumCount("SELECT pk FROM %s.diverged_several WHERE body MATCH 'brown' AND body PHRASE 'quick brown'"));
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.diverged_several WHERE body MATCH 'lazy' AND body PHRASE 'brown dog'"), ConsistencyLevel.QUORUM),
+                   row(pk));
+
+        // Two relations on a static column make the replicas filter non strictly
+        assertEquals(0, quorumCount("SELECT pk FROM %s.diverged_several_static WHERE s MATCH 'brown' AND s PHRASE 'quick brown'"));
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk, ck FROM %s.diverged_several_static WHERE s MATCH 'lazy' AND s PHRASE 'brown dog'"), ConsistencyLevel.QUORUM),
+                   row(pk, 1));
+    }
+
+    @Test
+    public void stockFilterAfterWordSearchOnMergedRows()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.logs_merged (pk int PRIMARY KEY, body text) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX logs_merged_body_idx ON %s.logs_merged(body) USING 'sai' " +
+                                          "WITH OPTIONS = { 'index_analyzer' : 'standard' }"));
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.logs_merged_static (pk int, ck int, s text static, PRIMARY KEY (pk, ck)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX logs_merged_static_idx ON %s.logs_merged_static(s) USING 'sai' " +
+                                          "WITH OPTIONS = { 'index_analyzer' : 'standard' }"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        List<Integer> replicas4 = replicaNodesFor(4);
+        List<Integer> replicas5 = replicaNodesFor(5);
+        assertEquals(2, replicas4.size());
+        assertEquals(2, replicas5.size());
+
+        // pk 4 has the stale 'Timeout' on one replica and the newer 'timeout after 30s' on the other,
+        // pk 5 the other way round. Every value holds the word timeout.
+        String insert = withKeyspace("INSERT INTO %s.logs_merged (pk, body) VALUES (?, ?) USING TIMESTAMP ?");
+        CLUSTER.get(replicas4.get(0)).executeInternal(insert, 4, "Timeout", 1L);
+        CLUSTER.get(replicas4.get(1)).executeInternal(insert, 4, "timeout after 30s", 2L);
+        CLUSTER.get(replicas5.get(0)).executeInternal(insert, 5, "timeout after 30s", 1L);
+        CLUSTER.get(replicas5.get(1)).executeInternal(insert, 5, "Timeout", 2L);
+
+        // The coordinator checks the IN and the range on the merged newest value
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.logs_merged WHERE body MATCH 'timeout' AND body IN ('Timeout', 'Disk full') ALLOW FILTERING"), ConsistencyLevel.QUORUM),
+                   row(5));
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.logs_merged WHERE body MATCH 'timeout' AND body > 'm' ALLOW FILTERING"), ConsistencyLevel.QUORUM),
+                   row(4));
+
+        // Two relations on a static column make the read non strict, and IN is refused on such reads
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.logs_merged_static (pk, ck, s) VALUES (0, 1, 'Timeout')"), ConsistencyLevel.ALL);
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.logs_merged_static (pk, ck, s) VALUES (1, 1, 'timeout after 30s')"), ConsistencyLevel.ALL);
+        String staticIn = withKeyspace("SELECT pk, ck FROM %s.logs_merged_static WHERE s MATCH 'timeout' AND s IN ('Timeout', 'Disk full') ALLOW FILTERING");
+        Assertions.assertThatThrownBy(() -> CLUSTER.coordinator(1).execute(staticIn, ConsistencyLevel.QUORUM))
+                  .hasMessageContaining(String.format(StorageAttachedIndexQueryPlan.UNSUPPORTED_NON_STRICT_OPERATOR, Operator.IN));
+        assertRows(CLUSTER.coordinator(1).execute(staticIn, ConsistencyLevel.ONE), row(0, 1));
+
+        // A range on a static column runs non strictly, with the intersect filtering guardrail warning
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk, ck FROM %s.logs_merged_static WHERE s MATCH 'timeout' AND s > 'm' ALLOW FILTERING"), ConsistencyLevel.QUORUM),
+                   row(1, 1));
     }
 
     private static int quorumCount(String select)

@@ -17,20 +17,42 @@
  */
 package org.apache.cassandra.index.sai.cql;
 
+import java.nio.ByteBuffer;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
 import org.junit.Before;
 import org.junit.Test;
 
 import com.datastax.driver.core.Session;
+import com.google.common.collect.ImmutableSet;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.cql3.statements.SelectStatement;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.PartitionRangeReadCommand;
+import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.ReadExecutionController;
 import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.rows.RowIterator;
 import org.apache.cassandra.index.sai.SAITester;
+import org.apache.cassandra.index.sai.utils.IndexTermType;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.utils.FBUtilities;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
@@ -297,13 +319,49 @@ public class AnalyzerMatchesQueryTest extends SAITester
     }
 
     @Test
-    public void matchOperatorRejectsMultipleRelationsOnOneColumn() throws Throwable
+    public void severalAnalyzedRelationsOnOneColumnAllMatch() throws Throwable
     {
         createTable("CREATE TABLE %s (id int PRIMARY KEY, body text)");
         createIndex("CREATE INDEX ON %s(body) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
 
-        assertInvalidMessage("cannot be restricted by more than one relation",
-                             "SELECT id FROM %s WHERE body MATCH 'quick' AND body MATCH 'fox'");
+        execute("INSERT INTO %s (id, body) VALUES (1, 'the quick brown fox')");
+        execute("INSERT INTO %s (id, body) VALUES (2, 'quick fox brown')");
+        execute("INSERT INTO %s (id, body) VALUES (3, 'lazy dog')");
+
+        beforeAndAfterFlush(this::assertSeveralAnalyzedRelations);
+
+        compact();
+        waitForCompactionsFinished();
+        assertSeveralAnalyzedRelations();
+
+        // On a static column every row of the matching partition is returned
+        createTable("CREATE TABLE %s (pk int, ck int, s text static, PRIMARY KEY (pk, ck))");
+        createIndex("CREATE INDEX ON %s(s) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+
+        execute("INSERT INTO %s (pk, ck, s) VALUES (1, 1, 'the quick brown fox')");
+        execute("INSERT INTO %s (pk, ck) VALUES (1, 2)");
+        execute("INSERT INTO %s (pk, ck, s) VALUES (2, 1, 'quick fox brown')");
+
+        beforeAndAfterFlush(() -> assertRowsIgnoringOrder(execute("SELECT pk, ck FROM %s WHERE s MATCH 'quick' AND s PHRASE 'brown fox'"),
+                                                          row(1, 1), row(1, 2)));
+    }
+
+    private void assertSeveralAnalyzedRelations() throws Throwable
+    {
+        // every relation must match
+        assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body MATCH 'quick' AND body MATCH 'fox'"), row(1), row(2));
+        assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body MATCH 'quick' AND body PHRASE 'brown fox'"), row(1));
+        assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body MATCH 'quick' AND body MATCH 'dog'"));
+        // each phrase is matched on its own, the two phrases never join into one
+        assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body PHRASE 'quick brown' AND body PHRASE 'fox brown'"));
+        assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body PHRASE 'quick brown' AND body PHRASE 'brown fox'"), row(1));
+
+        // the order of the relations, a duplicate relation and a third relation change nothing
+        assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body MATCH 'fox' AND body MATCH 'quick'"), row(1), row(2));
+        assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body PHRASE 'brown fox' AND body MATCH 'quick'"), row(1));
+        assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body MATCH 'dog' AND body MATCH 'quick'"));
+        assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body MATCH 'fox' AND body MATCH 'fox'"), row(1), row(2));
+        assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body MATCH 'quick' AND body MATCH 'fox' AND body PHRASE 'brown fox'"), row(1));
     }
 
     @Test
@@ -324,5 +382,254 @@ public class AnalyzerMatchesQueryTest extends SAITester
         String postFilterTrace = getSingleTraceStatement(session, "SELECT id FROM %s WHERE body MATCH 'quick'", "Index post-filter matched");
         assertNotNull(postFilterTrace);
         assertEquals("Index post-filter matched 1 of 1 rows", postFilterTrace);
+    }
+
+    @Test
+    public void severalAnalyzedRelationsBindEachMarker() throws Throwable
+    {
+        createTable("CREATE TABLE %s (id int PRIMARY KEY, body text)");
+        createIndex("CREATE INDEX ON %s(body) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+
+        execute("INSERT INTO %s (id, body) VALUES (1, 'Disk full on node 3')");
+        execute("INSERT INTO %s (id, body) VALUES (2, 'timeout after 30s')");
+        execute("INSERT INTO %s (id, body) VALUES (3, 'Connection timeout to db')");
+        execute("INSERT INTO %s (id, body) VALUES (4, 'Timeout')");
+
+        String phrase = "SELECT id FROM %s WHERE body MATCH ? AND body PHRASE ?";
+        String range = "SELECT id FROM %s WHERE body MATCH ? AND body > ? AND body < ? ALLOW FILTERING";
+        String in = "SELECT id FROM %s WHERE body MATCH ? AND body IN ? ALLOW FILTERING";
+
+        beforeAndAfterFlush(() -> {
+            assertRowsIgnoringOrder(execute(phrase, "timeout", "after 30s"), row(2));
+            assertRowsIgnoringOrder(execute(range, "timeout", "T", "U"), row(4));
+            assertRowsIgnoringOrder(execute(in, "timeout", List.of("Timeout", "Disk full")), row(4));
+            // IN ? bound to one value stays an IN, it is not parsed as =
+            assertRowsIgnoringOrder(execute(in, "timeout", List.of("Timeout")), row(4));
+        });
+
+        Session session = sessionNet();
+        assertRowsNet(session.execute(session.prepare(formatQuery(phrase)).bind("timeout", "after 30s")), row(2));
+        assertRowsNet(session.execute(session.prepare(formatQuery(range)).bind("timeout", "T", "U")), row(4));
+        assertRowsNet(session.execute(session.prepare(formatQuery(in)).bind("timeout", List.of("Timeout", "Disk full"))), row(4));
+        assertRowsNet(session.execute(session.prepare(formatQuery(in)).bind("timeout", List.of("Timeout"))), row(4));
+
+        // A function in the stock relation is one of the statement's functions
+        String function = "SELECT id FROM %s WHERE body MATCH 'timeout' AND body > blobAsText(0x6d) ALLOW FILTERING";
+        SelectStatement select = (SelectStatement) QueryProcessor.getStatement(formatQuery(function), ClientState.forInternalCalls());
+        Set<String> functions = new HashSet<>();
+        for (Function f : select.getFunctions())
+            functions.add(f.name().name);
+        assertTrue(functions.toString(), functions.contains("blobastext"));
+        assertRowsIgnoringOrder(execute(function), row(2));
+    }
+
+    @Test
+    public void analyzedOperatorsAreMultiExpression()
+    {
+        createTable("CREATE TABLE %s (id int PRIMARY KEY, body text)");
+        TableMetadata table = currentTableMetadata();
+        ColumnMetadata body = table.getColumn(ColumnIdentifier.getInterned("body", false));
+        IndexTermType termType = IndexTermType.create(body, table.partitionKeyColumns(), IndexTarget.Type.SIMPLE);
+        ByteBuffer value = UTF8Type.instance.decompose("quick");
+
+        // each analyzed relation keeps its own index expression
+        for (Operator operator : new Operator[]{ Operator.ANALYZER_MATCHES, Operator.PHRASE, Operator.ANALYZER_MATCHES_KEY, Operator.PHRASE_KEY })
+            assertTrue(operator.toString(), termType.isMultiExpression(RowFilter.create(false).add(body, operator, value)));
+
+        // the bounds of a range combine into one index expression
+        for (Operator operator : new Operator[]{ Operator.EQ, Operator.GT, Operator.LT })
+            assertFalse(operator.toString(), termType.isMultiExpression(RowFilter.create(false).add(body, operator, value)));
+    }
+
+    @Test
+    public void wordSearchThenStockFilterOnOneColumn() throws Throwable
+    {
+        createTable("CREATE TABLE %s (id int PRIMARY KEY, body text)");
+        createIndex("CREATE INDEX ON %s(body) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+
+        execute("INSERT INTO %s (id, body) VALUES (1, 'Disk full on node 3')");
+        execute("INSERT INTO %s (id, body) VALUES (2, 'timeout after 30s')");
+        execute("INSERT INTO %s (id, body) VALUES (3, 'Connection timeout to db')");
+        execute("INSERT INTO %s (id, body) VALUES (4, 'Timeout')");
+
+        // The index cannot answer a range or IN, so the query needs ALLOW FILTERING
+        for (String query : new String[]{ "SELECT id FROM %s WHERE body MATCH 'timeout' AND body > 'm'",
+                                          "SELECT id FROM %s WHERE body > 'm' AND body MATCH 'timeout'",
+                                          "SELECT id FROM %s WHERE body MATCH 'timeout' AND body >= 'T' AND body < 'U'",
+                                          "SELECT id FROM %s WHERE body >= 'T' AND body MATCH 'timeout' AND body < 'U'",
+                                          "SELECT id FROM %s WHERE body MATCH 'timeout' AND body IN ('Timeout', 'Disk full')",
+                                          "SELECT id FROM %s WHERE body IN ('Timeout', 'Disk full') AND body MATCH 'timeout'" })
+            assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE, query);
+
+        beforeAndAfterFlush(this::assertWordSearchThenStockFilter);
+
+        compact();
+        waitForCompactionsFinished();
+        assertWordSearchThenStockFilter();
+
+        // A second stock relation merges with the first one as it does without the word search
+        assertInvalidMessage("Column \"body\" cannot be restricted by both an equality and an inequality relation",
+                             "SELECT id FROM %s WHERE body MATCH 'x' AND body > 'a' AND body = 'b' ALLOW FILTERING");
+        assertInvalidMessage("body cannot be restricted by more than one relation if it includes a IN",
+                             "SELECT id FROM %s WHERE body IN ('a', 'b') AND body MATCH 'x' AND body > 'a' ALLOW FILTERING");
+        assertInvalidMessage("body cannot be restricted by more than one relation if it includes a IN",
+                             "SELECT id FROM %s WHERE body MATCH 'x' AND body IN ('a', 'b') AND body > 'a' ALLOW FILTERING");
+    }
+
+    private void assertWordSearchThenStockFilter() throws Throwable
+    {
+        // The index finds the rows with the word, then the range or IN is checked on the whole raw value
+        // in byte order, where 'Timeout' < 'm' < 'timeout after 30s'
+        assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body MATCH 'timeout' AND body > 'm' ALLOW FILTERING"), row(2));
+        assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body > 'm' AND body MATCH 'timeout' ALLOW FILTERING"), row(2));
+        assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body MATCH 'timeout' AND body >= 'T' AND body < 'U' ALLOW FILTERING"), row(4));
+        assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body >= 'T' AND body MATCH 'timeout' AND body < 'U' ALLOW FILTERING"), row(4));
+        assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body MATCH 'timeout' AND body IN ('Timeout', 'Disk full') ALLOW FILTERING"), row(4));
+        assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body IN ('Timeout', 'Disk full') AND body MATCH 'timeout' ALLOW FILTERING"), row(4));
+    }
+
+    @Test
+    public void rangeOrInAloneKeepsStockFiltering() throws Throwable
+    {
+        createTable("CREATE TABLE %s (id int PRIMARY KEY, body text)");
+        createIndex("CREATE INDEX ON %s(body) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+
+        execute("INSERT INTO %s (id, body) VALUES (1, 'Disk full on node 3')");
+        execute("INSERT INTO %s (id, body) VALUES (2, 'timeout after 30s')");
+        execute("INSERT INTO %s (id, body) VALUES (3, 'Connection timeout to db')");
+        execute("INSERT INTO %s (id, body) VALUES (4, 'Timeout')");
+
+        String range = "SELECT id FROM %s WHERE body > 'm'";
+        String in = "SELECT id FROM %s WHERE body IN ('Timeout', 'Disk full')";
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE, range);
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE, in);
+
+        beforeAndAfterFlush(() -> {
+            assertRowsIgnoringOrder(execute(range + " ALLOW FILTERING"), row(2));
+            assertRowsIgnoringOrder(execute(in + " ALLOW FILTERING"), row(4));
+        });
+
+        // Neither query uses the analyzed index
+        for (String query : new String[]{ range, in })
+        {
+            SelectStatement select = (SelectStatement) QueryProcessor.getStatement(formatQuery(query + " ALLOW FILTERING"), ClientState.forInternalCalls());
+            ReadCommand command = (ReadCommand) select.getQuery(QueryOptions.DEFAULT, FBUtilities.nowInSeconds());
+            assertNull(query, command.indexQueryPlan());
+        }
+    }
+
+    @Test
+    public void rangesAndInOnOtherColumnsWithWordSearch() throws Throwable
+    {
+        createTable("CREATE TABLE %s (id int PRIMARY KEY, body text, n int, ts timestamp)");
+        createIndex("CREATE INDEX ON %s(body) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        createIndex("CREATE INDEX ON %s(n) USING 'sai'");
+
+        execute("INSERT INTO %s (id, body, n, ts) VALUES (1, 'the quick brown fox', 7, '2026-02-01')");
+        execute("INSERT INTO %s (id, body, n, ts) VALUES (2, 'quick fox brown', 3, '2025-06-01')");
+        execute("INSERT INTO %s (id, body, n, ts) VALUES (3, 'lazy dog', 9, '2026-03-01')");
+        execute("INSERT INTO %s (id, body, n, ts) VALUES (4, 'quick brown fox jumps', 1, '2026-05-01')");
+
+        String in = "SELECT id FROM %s WHERE body MATCH 'quick' AND n IN (1, 7)";
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE, in);
+
+        beforeAndAfterFlush(() -> {
+            // every relation has an index, so no ALLOW FILTERING
+            assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body MATCH 'quick' AND n > 5"), row(1));
+            assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body MATCH 'quick' AND body PHRASE 'brown fox' AND n > 5"), row(1));
+            // IN and a column without an index are checked by filtering
+            assertRowsIgnoringOrder(execute(in + " ALLOW FILTERING"), row(1), row(4));
+            assertRowsIgnoringOrder(execute("SELECT id FROM %s WHERE body MATCH 'quick' AND ts > '2026-01-01' ALLOW FILTERING"), row(1), row(4));
+        });
+    }
+
+    @Test
+    public void inIsRecheckedUnderReplicaFilteringProtectionWithoutDisjunction() throws Throwable
+    {
+        createTable("CREATE TABLE %s (id int PRIMARY KEY, body text)");
+        createIndex("CREATE INDEX ON %s(body) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+
+        execute("INSERT INTO %s (id, body) VALUES (1, 'Disk full on node 3')");
+        execute("INSERT INTO %s (id, body) VALUES (2, 'timeout after 30s')");
+        execute("INSERT INTO %s (id, body) VALUES (3, 'Connection timeout to db')");
+        execute("INSERT INTO %s (id, body) VALUES (4, 'Timeout')");
+
+        String withIn = "SELECT id FROM %s WHERE body MATCH 'timeout' AND body IN ('Timeout', 'Disk full') ALLOW FILTERING";
+        String withSlice = "SELECT id FROM %s WHERE body MATCH 'timeout' AND body > 'm' ALLOW FILTERING";
+        for (String query : new String[]{ withSlice, withIn })
+        {
+            SelectStatement select = (SelectStatement) QueryProcessor.getStatement(formatQuery(query), ClientState.forInternalCalls());
+            ReadCommand command = (ReadCommand) select.getQuery(QueryOptions.DEFAULT, FBUtilities.nowInSeconds());
+
+            if (query.equals(withIn))
+            {
+                // The post index filter holds exactly the IN, which the index filter leaves out
+                List<RowFilter.Expression> post = command.indexQueryPlan().postIndexQueryFilter().getExpressions();
+                assertEquals(post.toString(), 1, post.size());
+                assertEquals(Operator.IN, post.get(0).operator());
+                assertEquals("body", post.get(0).column().name.toString());
+            }
+
+            // Every row of the table, as the merged rows reach the coordinator re-check
+            PartitionRangeReadCommand allData = PartitionRangeReadCommand.allDataRead(getCurrentColumnFamilyStore().metadata(), FBUtilities.nowInSeconds());
+            Set<Integer> kept = new HashSet<>();
+            try (ReadExecutionController controller = allData.executionController();
+                 PartitionIterator partitions = command.indexSearcher().filterReplicaFilteringProtection(allData.executeInternal(controller)))
+            {
+                while (partitions.hasNext())
+                {
+                    try (RowIterator partition = partitions.next())
+                    {
+                        if (partition.hasNext())
+                            kept.add(Int32Type.instance.compose(partition.partitionKey().getKey()));
+                    }
+                }
+            }
+            assertEquals(query, query.equals(withIn) ? ImmutableSet.of(4) : ImmutableSet.of(2), kept);
+        }
+    }
+
+    @Test
+    public void tracingReportsEachAnalyzedRelation() throws Throwable
+    {
+        createTable("CREATE TABLE %s (id int PRIMARY KEY, body text)");
+        createIndex("CREATE INDEX ON %s(body) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+
+        execute("INSERT INTO %s (id, body) VALUES (1, 'the quick brown fox')");
+        flush();
+
+        Session session = sessionNet();
+        String query = "SELECT id FROM %s WHERE body MATCH 'quick' AND body PHRASE 'brown fox'";
+        String matchTrace = getSingleTraceStatement(session, query, "Query analyzed body MATCH");
+        assertNotNull(matchTrace);
+        assertTrue(matchTrace, matchTrace.contains("quick@0"));
+        String phraseTrace = getSingleTraceStatement(session, query, "Query analyzed body PHRASE");
+        assertNotNull(phraseTrace);
+        assertTrue(phraseTrace, phraseTrace.contains("brown@0"));
+        assertTrue(phraseTrace, phraseTrace.contains("fox@1"));
+    }
+
+    @Test
+    public void containsServedByALegacyIndexNeedsAllowFiltering() throws Throwable
+    {
+        createTable("CREATE TABLE %s (id int PRIMARY KEY, tags set<text>)");
+        createIndex("CREATE INDEX ON %s(tags) USING 'sai' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        createIndex("CREATE INDEX ON %s(tags) USING 'legacy_local_table'");
+
+        execute("INSERT INTO %s (id, tags) VALUES (1, {'red', 'quick fox'})");
+        execute("INSERT INTO %s (id, tags) VALUES (2, {'blue', 'quick dog'})");
+        execute("INSERT INTO %s (id, tags) VALUES (3, {'red', 'lazy dog'})");
+
+        // Only the legacy index answers CONTAINS and only the analyzed index answers MATCH, so no one
+        // index serves the query and it needs ALLOW FILTERING
+        String containsFirst = "SELECT id FROM %s WHERE tags CONTAINS 'red' AND tags MATCH 'quick'";
+        String matchFirst = "SELECT id FROM %s WHERE tags MATCH 'quick' AND tags CONTAINS 'red'";
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE, containsFirst);
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE, matchFirst);
+
+        beforeAndAfterFlush(() -> {
+            assertRowsIgnoringOrder(execute(containsFirst + " ALLOW FILTERING"), row(1));
+            assertRowsIgnoringOrder(execute(matchFirst + " ALLOW FILTERING"), row(1));
+        });
     }
 }
