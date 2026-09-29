@@ -44,6 +44,7 @@ import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionPurger;
 import org.apache.cassandra.db.Keyspace;
@@ -74,6 +75,7 @@ import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexRegistry;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.locator.AbstractReplicationStrategy;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
@@ -173,6 +175,25 @@ public class RowFilter implements Iterable<RowFilter.Expression>
     public boolean needsReconciliation()
     {
         return needsReconciliation;
+    }
+
+    /**
+     * @return true if a read at this consistency level always resolves the responses of two or more replicas.
+     * Only then can short read protection ask a replica for more rows after the coordinator re-check drops rows
+     * that replica sent, so only then may a replica send rows that match part of this filter.
+     */
+    public static boolean resolvesTwoOrMoreReplicas(ConsistencyLevel consistency, AbstractReplicationStrategy replication)
+    {
+        // NODE_LOCAL has no blockFor, and like ONE and LOCAL_ONE it reads one replica
+        return consistency.needsReconciliation() && consistency.blockFor(replication) >= 2;
+    }
+
+    /**
+     * @return a filter over the same tree for a read that resolves one replica, which applies it strictly
+     */
+    public RowFilter withoutReconciliation()
+    {
+        return new RowFilter(root, false);
     }
 
     /**

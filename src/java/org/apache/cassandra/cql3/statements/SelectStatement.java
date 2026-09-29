@@ -995,6 +995,13 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
         if (filter.needsReconciliation() && filter.isMutableIntersection() && restrictions.needFiltering(table))
             Guardrails.intersectFilteringQueryEnabled.ensureEnabled(state);
 
+        // A replica may send rows that match only part of an OR filter because short read protection asks it for
+        // more once the coordinator re-check drops them. With one contacted replica short read protection never runs,
+        // so the replica filters strictly.
+        if (filter.containsDisjunction() && filter.needsReconciliation() &&
+            !RowFilter.resolvesTwoOrMoreReplicas(options.getConsistency(), Keyspace.open(table.keyspace).getReplicationStrategy()))
+            filter = filter.withoutReconciliation();
+
         return filter;
     }
 

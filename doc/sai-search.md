@@ -254,9 +254,9 @@ ALLOW FILTERING and is evaluated by filtering. There is no cost model for unions
 cut, so very unselective disjunctions can materialize large key sets; the standard SAI
 guardrails still apply per predicate.
 
-At a consistency level above `ONE`, on the index path and on the filtering path alike, the
-replicas together return every row that could match once their copies are merged, and the
-coordinator filters the merged rows. On the filtering path a replica sends every row that
+When a read waits for two or more replicas, on the index path and on the filtering path
+alike, the replicas together return every row that could match once their copies are merged,
+and the coordinator filters the merged rows. On the filtering path a replica sends every row that
 matches one chosen condition of each AND group, preferring a condition that is not on a
 static column. Every node must use the same rule for choosing that condition. A release
 that changes the rule says so in its upgrade notes. For an `OR` query that restricts static
@@ -266,6 +266,12 @@ were written to different replicas, at the cost of more rows sent to the coordin
 disjunction over wide partitions can therefore reach the replica filtering protection limit
 `replica_filtering_protection.cached_rows_fail_threshold` and fail instead of returning
 incomplete results.
+
+A read that waits for one replica filters strictly on it, as at `ONE`. That is `ONE`,
+`LOCAL_ONE` and `NODE_LOCAL`, any level on a keyspace with a replication factor of 1, and
+`LOCAL_QUORUM` or `LOCAL_SERIAL` in a data center that holds one replica of the keyspace. Such a
+read sends no extra rows, and it accepts an `IN` restriction next to `OR`, as `ONE` does. The
+intersect filtering guardrail still applies to it as to any read above `ONE`.
 
 A query without `OR` keeps the Apache Cassandra behaviour: with ALLOW FILTERING at a
 consistency level above `ONE`, it can miss a row whose matching values were written to
