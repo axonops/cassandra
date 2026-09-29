@@ -461,10 +461,10 @@ public class DisjunctionQueryTest extends SAITester
         }
         assertEquals(ImmutableSet.of(List.of(0, 4)), merged);
 
-        // The first entry is a control and keeps plain AND with ALLOW FILTERING as Apache evaluates it.
-        // With a disjunction the replica keeps a row when its key column expressions and x, the first
-        // conjunct, match. (0, 2) matches only the disjunction and stays behind.
-        Map<String, Set<List<Integer>>> expected = ImmutableMap.of(stock, ImmutableSet.of(List.of(0, 4)),
+        // A plain AND read at QUORUM keeps rows matching a, the restricted column that comes first in name
+        // byte order. With a disjunction the replica keeps a row when its key column expressions and x, the
+        // first conjunct, match. (0, 2) matches only the disjunction and stays behind.
+        Map<String, Set<List<Integer>>> expected = ImmutableMap.of(stock, ImmutableSet.of(List.of(0, 2), List.of(0, 4)),
                                                                    anchored, ImmutableSet.of(List.of(0, 1), List.of(0, 4), List.of(1, 1)),
                                                                    clustering, ImmutableSet.of(List.of(0, 1), List.of(1, 1)));
         for (Map.Entry<String, Set<List<Integer>>> entry : expected.entrySet())

@@ -1002,6 +1002,10 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
             !RowFilter.resolvesTwoOrMoreReplicas(options.getConsistency(), Keyspace.open(table.keyspace).getReplicationStrategy()))
             filter = filter.withoutReconciliation();
 
+        // With no index, replicas may send partial matches and the coordinator filters the merged rows
+        if (!filter.isStrict())
+            filter = filter.withPartialMatchesIfFiltering(restrictions.usesSecondaryIndexing(), options.getConsistency(), Keyspace.open(table.keyspace).getReplicationStrategy());
+
         return filter;
     }
 

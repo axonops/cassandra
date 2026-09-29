@@ -199,6 +199,9 @@ public abstract class AbstractReadExecutor
                                                                     consistencyLevel,
                                                                     retry);
 
+        if (PartialMatchReadExecutor.appliesTo(command))
+            return PartialMatchReadExecutor.create(cfs, command, replicaPlan, retry, consistencyLevel, requestTime);
+
         // Speculative retry is disabled *OR*
         // 11980: Disable speculative retry if using EACH_QUORUM in order to prevent miscounting DC responses
         if (retry.equals(NeverSpeculativeRetryPolicy.INSTANCE) || consistencyLevel == ConsistencyLevel.EACH_QUORUM)
@@ -255,6 +258,11 @@ public abstract class AbstractReadExecutor
     ReplicaPlan.ForTokenRead replicaPlan()
     {
         return replicaPlan.get();
+    }
+
+    ReplicaPlan.SharedForTokenRead sharedReplicaPlan()
+    {
+        return replicaPlan;
     }
 
     void onReadTimeout() {}

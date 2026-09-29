@@ -1065,6 +1065,8 @@ public abstract class ReadCommand extends AbstractReadQuery
         private static final int HAS_INDEX = 0x04;
         private static final int ACCEPTS_TRANSIENT = 0x08;
         private static final int NEEDS_RECONCILIATION = 0x10;
+        // Apache uses 0x20 from 6.0, so this fork flag takes the top bit
+        private static final int ACCEPTS_PARTIAL_MATCHES = 0x80;
 
         private final SchemaProvider schema;
 
@@ -1129,6 +1131,16 @@ public abstract class ReadCommand extends AbstractReadQuery
             return (flags & NEEDS_RECONCILIATION) != 0;
         }
 
+        private static int acceptsPartialMatchesFlag(boolean acceptsPartialMatches)
+        {
+            return acceptsPartialMatches ? ACCEPTS_PARTIAL_MATCHES : 0;
+        }
+
+        private static boolean acceptsPartialMatches(int flags)
+        {
+            return (flags & ACCEPTS_PARTIAL_MATCHES) != 0;
+        }
+
         public void serialize(ReadCommand command, DataOutputPlus out, int version) throws IOException
         {
             out.writeByte(command.kind.ordinal());
@@ -1137,6 +1149,7 @@ public abstract class ReadCommand extends AbstractReadQuery
                     | indexFlag(null != command.indexQueryPlan())
                     | acceptsTransientFlag(command.acceptsTransient())
                     | needsReconciliationFlag(command.rowFilter().needsReconciliation())
+                    | acceptsPartialMatchesFlag(command.rowFilter().acceptsPartialMatches())
             );
             if (command.isDigestQuery())
                 out.writeUnsignedVInt32(command.digestVersion());
@@ -1176,6 +1189,8 @@ public abstract class ReadCommand extends AbstractReadQuery
             long nowInSec = version >= MessagingService.VERSION_50 ? CassandraUInt.toLong(in.readInt()) : in.readInt();
             ColumnFilter columnFilter = ColumnFilter.serializer.deserialize(in, version, metadata);
             RowFilter rowFilter = RowFilter.serializer.deserialize(in, version, metadata, needsReconciliation);
+            if (acceptsPartialMatches(flags))
+                rowFilter = rowFilter.withPartialMatches();
             DataLimits limits = DataLimits.serializer.deserialize(in, version,  metadata);
 
             Index.QueryPlan indexQueryPlan = null;

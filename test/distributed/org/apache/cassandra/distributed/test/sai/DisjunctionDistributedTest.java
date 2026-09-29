@@ -420,12 +420,11 @@ public class DisjunctionDistributedTest extends TestBaseImpl
             CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.filter_split (pk, ck, a, b, c, d, x) VALUES (0, ?, '0', '0', '0', '0', '1')"),
                                            ConsistencyLevel.ALL, ck);
 
-        // Control. Plain AND with ALLOW FILTERING keeps the Apache behaviour. Each replica checks the
-        // whole AND on its own copy, so a row whose matching values sit on different replicas is not
-        // returned. The fork leaves it unchanged, and the assertion makes any change a visible decision.
+        // Plain AND with ALLOW FILTERING keeps split rows too. Each replica keeps a row when a, the
+        // restricted column that comes first in name byte order, matches.
         String stock = "SELECT ck FROM %s.filter_split WHERE x = '1' AND a = '1' ALLOW FILTERING";
-        assertEquals(0, CLUSTER.coordinator(1).execute(withKeyspace(stock), ConsistencyLevel.ALL).length);
-        assertEquals(0, CLUSTER.coordinator(1).execute(withKeyspace(stock), ConsistencyLevel.QUORUM).length);
+        assertEquals(ImmutableSet.of(10, 11, 12), valuesAt(stock, ConsistencyLevel.ALL));
+        assertEquals(1, CLUSTER.coordinator(1).execute(withKeyspace(stock), ConsistencyLevel.QUORUM).length);
 
         // Control. The coordinator re-check runs at ONE too
         String query = "SELECT ck FROM %s.filter_split WHERE x = '1' AND (a = '1' OR b = '2') ALLOW FILTERING";
@@ -483,11 +482,11 @@ public class DisjunctionDistributedTest extends TestBaseImpl
         }
         CLUSTER.get(1).executeInternal(withKeyspace("UPDATE %s.filter_static USING TIMESTAMP 2 SET s = '1', t = '1' WHERE pk = 4"));
 
-        // Control. Plain AND with ALLOW FILTERING keeps the Apache behaviour. Each replica checks the
-        // whole AND on its own copy, so a row whose matching values sit on different replicas is not
-        // returned. The fork leaves it unchanged, and the assertion makes any change a visible decision.
+        // Plain AND with ALLOW FILTERING keeps split rows too. (0, 1) holds s on node 1 and a on node 2.
+        // (4, 2) holds a on nodes 2 and 3 under an older s, and node 1 holds the newest s = '1'.
         assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk, ck FROM %s.filter_static WHERE s = '1' AND a = '1' ALLOW FILTERING"),
-                                                  ConsistencyLevel.ALL));
+                                                  ConsistencyLevel.ALL),
+                   row(0, 1), row(4, 2));
 
         // (0, 1) comes back through the row fetched from node 1, which also returns node 1's static row
         assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk, ck FROM %s.filter_static WHERE s = '1' AND (a = '1' OR b = '2') ALLOW FILTERING"),

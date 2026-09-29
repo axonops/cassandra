@@ -273,9 +273,25 @@ A read that waits for one replica filters strictly on it, as at `ONE`. That is `
 read sends no extra rows, and it accepts an `IN` restriction next to `OR`, as `ONE` does. The
 intersect filtering guardrail still applies to it as to any read above `ONE`.
 
-A query without `OR` keeps the Apache Cassandra behaviour: with ALLOW FILTERING at a
-consistency level above `ONE`, it can miss a row whose matching values were written to
-different replicas.
+A query without `OR` that uses ALLOW FILTERING and no index gets the same protection. At a
+consistency level that waits for two or more replicas, each replica sends every row that
+matches one condition of the query, together with any clustering conditions: the restricted
+regular column whose name comes first in byte order, or the first static column when only
+static columns are restricted. The coordinator reads every
+contacted replica in full, also when the partition key is restricted, and filters the merged
+rows. `SERIAL` and `LOCAL_SERIAL` reads keep the Apache Cassandra behaviour and can miss such
+a row. This is always on. While a cluster mixes Apache Cassandra nodes with fork nodes, a read
+coordinated by an Apache Cassandra node keeps the Apache behaviour, and an Apache Cassandra
+replica still checks every condition, so a row with a part on such a replica can be missed
+until it is upgraded. These queries send more
+rows to the coordinator. A query over a wide partition can reach
+`replica_filtering_protection.cached_rows_fail_threshold` and fail instead of returning
+incomplete results. Replicas can be asked for more rows several times per page, and those
+follow up reads go to one replica with no speculative retry, so a replica that stalls after
+its first answer can time the query out. Each request is checked against
+`local_read_size_warn_threshold` and `local_read_size_fail_threshold` on its own. To cope,
+page the query, raise the replica filtering protection threshold, read at `LOCAL_ONE`, or add
+an index. The `intersect_filtering_query` guardrail warns about these queries.
 
 Static columns may appear inside `OR`. One boundary case to know: a partition whose only
 content is a matching static row (no regular rows at all) produces no result row for a

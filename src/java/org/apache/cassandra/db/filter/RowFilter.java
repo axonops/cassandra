@@ -110,10 +110,21 @@ public class RowFilter implements Iterable<RowFilter.Expression>
 
     private final boolean needsReconciliation;
 
+    // Set only on a filter whose coordinator resolves every contacted replica in full, see withPartialMatches()
+    private final boolean acceptsPartialMatches;
+
     protected RowFilter(FilterElement root, boolean needsReconciliation)
     {
         this.root = root;
         this.needsReconciliation = needsReconciliation;
+        this.acceptsPartialMatches = false;
+    }
+
+    private RowFilter(FilterElement root, boolean needsReconciliation, boolean acceptsPartialMatches)
+    {
+        this.root = root;
+        this.needsReconciliation = needsReconciliation;
+        this.acceptsPartialMatches = acceptsPartialMatches;
     }
 
     /**
@@ -194,6 +205,39 @@ public class RowFilter implements Iterable<RowFilter.Expression>
     public RowFilter withoutReconciliation()
     {
         return new RowFilter(root, false);
+    }
+
+    /**
+     * The filter a coordinator sends for a read that uses no index, is not strict, is not a SERIAL read and
+     * blocks for two or more replicas. Such a coordinator resolves every contacted replica in full and
+     * re-checks this filter on the merged rows, so a replica may keep a row that matches only part of it
+     * (see filterOnReplica). Copies built with a new RowFilter drop the setting.
+     */
+    public RowFilter withPartialMatchesIfFiltering(boolean usesSecondaryIndexing, ConsistencyLevel consistency,
+                                                   AbstractReplicationStrategy replication)
+    {
+        if (usesSecondaryIndexing || containsDisjunction() || isStrict() || consistency.isSerialConsistency()
+            || !resolvesTwoOrMoreReplicas(consistency, replication))
+            return this;
+
+        return withPartialMatches();
+    }
+
+    /**
+     * @return this filter for a read whose replicas may send rows that match only part of it
+     */
+    public RowFilter withPartialMatches()
+    {
+        return new RowFilter(root, needsReconciliation, true);
+    }
+
+    /**
+     * @return true if replicas may return rows that match only part of this filter, because the coordinator
+     * re-checks it on the merged rows of every contacted replica
+     */
+    public boolean acceptsPartialMatches()
+    {
+        return acceptsPartialMatches;
     }
 
     /**
@@ -344,6 +388,9 @@ public class RowFilter implements Iterable<RowFilter.Expression>
         if (containsDisjunction() && needsReconciliation() && (!isStrict() || hasStaticExpression()))
             return Transformation.apply(iter, filterOnReplica(iter.metadata(), nowInSec));
 
+        if (acceptsPartialMatches && !isStrict())
+            return Transformation.apply(iter, filterOnReplica(iter.metadata(), nowInSec));
+
         return isEmpty() ? iter : Transformation.apply(iter, filter(iter.metadata(), nowInSec));
     }
 
@@ -361,14 +408,16 @@ public class RowFilter implements Iterable<RowFilter.Expression>
     }
 
     /**
-     * The replica filter for a filter with a disjunction on a read that needs reconciliation. A replica
+     * The replica filter for a read that accepts partial matches: a filter with a disjunction that needs
+     * reconciliation, or a filter built by withPartialMatches. A replica
      * may hold only some of the cells a row matches on once the copies are merged, so a conjunction over
      * several mutable columns keeps a row when its key column expressions and one chosen conjunct match.
      * A partition whose static row alone satisfies the filter this way is kept with no rows, so replica
      * filtering protection reads that partition from the other replicas. A filter with a static leaf and
      * no such conjunction comes here for that reason alone, and its rows are checked as
      * filter(TableMetadata, long) checks them. The coordinator re-check uses {@link #filter(PartitionIterator, TableMetadata, long)},
-     * which stays strict. Only range reads reach this, since digest reads skip the coordinator re-check.
+     * which stays strict. Range reads and flagged partition reads reach this, never a digest read, since
+     * digest reads skip the coordinator re-check.
      */
     private Transformation<BaseRowIterator<?>> filterOnReplica(TableMetadata metadata, long nowInSec)
     {
