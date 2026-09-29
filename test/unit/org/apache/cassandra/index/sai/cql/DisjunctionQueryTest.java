@@ -20,6 +20,7 @@ package org.apache.cassandra.index.sai.cql;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import org.junit.Before;
@@ -27,6 +28,7 @@ import org.junit.Test;
 
 import com.datastax.driver.core.Row;
 import com.datastax.driver.core.Session;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.cql3.QueryOptions;
@@ -48,7 +50,9 @@ import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -408,5 +412,135 @@ public class DisjunctionQueryTest extends SAITester
             }
             assertEquals(query, query.equals(withIn) ? ImmutableSet.of(1) : ImmutableSet.of(0, 1), kept);
         }
+    }
+
+    @Test
+    public void filteringReplicaKeepsRowsMatchingTheAnchor() throws Throwable
+    {
+        // RF 3 on this single node makes a QUORUM read need reconciliation. With no index the replica
+        // filters its rows with the row filter alone.
+        String keyspace = createKeyspace("CREATE KEYSPACE %s WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 3 }");
+        String table = keyspace + '.' + createTable(keyspace, "CREATE TABLE %s (pk int, ck1 int, ck2 int, a text, b text, x text, PRIMARY KEY (pk, ck1, ck2))");
+
+        // Rows are named (pk, ck2) and all have ck1 = 0, so ck2 = 1 needs filtering and enters the row
+        // filter. (0, 1) and (1, 1) match x only, (0, 2) matches the disjunction only, (0, 3) matches
+        // nothing and (0, 4) matches the whole query.
+        execute("INSERT INTO " + table + " (pk, ck1, ck2, x, a) VALUES (0, 0, 1, '1', '0')");
+        execute("INSERT INTO " + table + " (pk, ck1, ck2, x, a) VALUES (0, 0, 2, '0', '1')");
+        execute("INSERT INTO " + table + " (pk, ck1, ck2, x, a) VALUES (0, 0, 3, '0', '0')");
+        execute("INSERT INTO " + table + " (pk, ck1, ck2, x, a) VALUES (0, 0, 4, '1', '1')");
+        execute("INSERT INTO " + table + " (pk, ck1, ck2, x, a) VALUES (1, 0, 1, '1', '0')");
+
+        String anchored = "SELECT pk, ck2 FROM " + table + " WHERE x = '1' AND (a = '1' OR b = '2') ALLOW FILTERING";
+        String clustering = "SELECT pk, ck2 FROM " + table + " WHERE ck2 = 1 AND x = '1' AND (a = '1' OR b = '2') ALLOW FILTERING";
+        String stock = "SELECT pk, ck2 FROM " + table + " WHERE x = '1' AND a = '1' ALLOW FILTERING";
+
+        // Control. A read at ONE needs no reconciliation, so the replica stays strict. execute has no
+        // coordinator re-check, so a replica keeping more rows would show here.
+        assertRows(execute(anchored), row(0, 4));
+
+        // Control. The coordinator re-check of the merged rows stays strict. Every row of the table
+        // stands in for the merged rows.
+        QueryOptions quorum = QueryOptions.forInternalCalls(ConsistencyLevel.QUORUM, Collections.emptyList());
+        SelectStatement anchoredSelect = (SelectStatement) QueryProcessor.getStatement(anchored, ClientState.forInternalCalls());
+        ReadCommand anchoredCommand = (ReadCommand) anchoredSelect.getQuery(quorum, FBUtilities.nowInSeconds());
+        PartitionRangeReadCommand allData = PartitionRangeReadCommand.allDataRead(anchoredCommand.metadata(), FBUtilities.nowInSeconds());
+        Set<List<Integer>> merged = new HashSet<>();
+        try (ReadExecutionController controller = allData.executionController();
+             PartitionIterator partitions = anchoredCommand.rowFilter().filter(allData.executeInternal(controller), anchoredCommand.metadata(), FBUtilities.nowInSeconds()))
+        {
+            while (partitions.hasNext())
+            {
+                try (RowIterator partition = partitions.next())
+                {
+                    int pk = Int32Type.instance.compose(partition.partitionKey().getKey());
+                    while (partition.hasNext())
+                        merged.add(List.of(pk, Int32Type.instance.compose(partition.next().clustering().bufferAt(1))));
+                }
+            }
+        }
+        assertEquals(ImmutableSet.of(List.of(0, 4)), merged);
+
+        // The first entry is a control and keeps plain AND with ALLOW FILTERING as Apache evaluates it.
+        // With a disjunction the replica keeps a row when its key column expressions and x, the first
+        // conjunct, match. (0, 2) matches only the disjunction and stays behind.
+        Map<String, Set<List<Integer>>> expected = ImmutableMap.of(stock, ImmutableSet.of(List.of(0, 4)),
+                                                                   anchored, ImmutableSet.of(List.of(0, 1), List.of(0, 4), List.of(1, 1)),
+                                                                   clustering, ImmutableSet.of(List.of(0, 1), List.of(1, 1)));
+        for (Map.Entry<String, Set<List<Integer>>> entry : expected.entrySet())
+        {
+            SelectStatement select = (SelectStatement) QueryProcessor.getStatement(entry.getKey(), ClientState.forInternalCalls());
+            ReadCommand command = (ReadCommand) select.getQuery(quorum, FBUtilities.nowInSeconds());
+            assertNull(entry.getKey(), command.indexQueryPlan());
+
+            Set<List<Integer>> kept = new HashSet<>();
+            try (ReadExecutionController controller = command.executionController();
+                 UnfilteredPartitionIterator partitions = command.executeLocally(controller))
+            {
+                while (partitions.hasNext())
+                {
+                    try (UnfilteredRowIterator partition = partitions.next())
+                    {
+                        int pk = Int32Type.instance.compose(partition.partitionKey().getKey());
+                        while (partition.hasNext())
+                            kept.add(List.of(pk, Int32Type.instance.compose(partition.next().clustering().bufferAt(1))));
+                    }
+                }
+            }
+            assertEquals(entry.getKey(), entry.getValue(), kept);
+        }
+    }
+
+    @Test
+    public void filteringReplicaReturnsStaticOnlyPartition() throws Throwable
+    {
+        String keyspace = createKeyspace("CREATE KEYSPACE %s WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 3 }");
+        String table = keyspace + '.' + createTable(keyspace, "CREATE TABLE %s (pk int, ck int, s text static, t text static, a text, PRIMARY KEY (pk, ck))");
+
+        // Static rows only. pk 0 matches the whole query, pk 1 matches nothing and pk 5 matches s only.
+        execute("INSERT INTO " + table + " (pk, s, t) VALUES (0, '1', '1')");
+        execute("INSERT INTO " + table + " (pk, s, t) VALUES (1, '0', '0')");
+        execute("INSERT INTO " + table + " (pk, s, t) VALUES (5, '1', '0')");
+
+        String query = "SELECT pk FROM " + table + " WHERE s = '1' AND (t = '1' OR a = '1') ALLOW FILTERING";
+        QueryOptions quorum = QueryOptions.forInternalCalls(ConsistencyLevel.QUORUM, Collections.emptyList());
+        SelectStatement select = (SelectStatement) QueryProcessor.getStatement(query, ClientState.forInternalCalls());
+        ReadCommand command = (ReadCommand) select.getQuery(quorum, FBUtilities.nowInSeconds());
+        assertNull(command.indexQueryPlan());
+
+        // Control. The coordinator re-check returns no partition, since no partition has a row
+        PartitionRangeReadCommand allData = PartitionRangeReadCommand.allDataRead(command.metadata(), FBUtilities.nowInSeconds());
+        Set<Integer> merged = new HashSet<>();
+        try (ReadExecutionController controller = allData.executionController();
+             PartitionIterator partitions = command.rowFilter().filter(allData.executeInternal(controller), command.metadata(), FBUtilities.nowInSeconds()))
+        {
+            while (partitions.hasNext())
+            {
+                try (RowIterator partition = partitions.next())
+                {
+                    merged.add(Int32Type.instance.compose(partition.partitionKey().getKey()));
+                }
+            }
+        }
+        assertEquals(ImmutableSet.of(), merged);
+
+        // The replica returns pk 0 with its static row and no rows, so replica filtering protection can
+        // read the partition from the other replicas. pk 5 matches only s. The replica checks the
+        // disjunction instead, because it is the first conjunct not only on static columns.
+        Set<Integer> kept = new HashSet<>();
+        try (ReadExecutionController controller = command.executionController();
+             UnfilteredPartitionIterator partitions = command.executeLocally(controller))
+        {
+            while (partitions.hasNext())
+            {
+                try (UnfilteredRowIterator partition = partitions.next())
+                {
+                    assertFalse(partition.hasNext());
+                    assertFalse(partition.staticRow().isEmpty());
+                    kept.add(Int32Type.instance.compose(partition.partitionKey().getKey()));
+                }
+            }
+        }
+        assertEquals(ImmutableSet.of(0), kept);
     }
 }

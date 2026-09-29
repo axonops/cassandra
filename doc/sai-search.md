@@ -254,12 +254,22 @@ ALLOW FILTERING and is evaluated by filtering. There is no cost model for unions
 cut, so very unselective disjunctions can materialize large key sets; the standard SAI
 guardrails still apply per predicate.
 
-At a consistency level above `ONE`, a replica keeps every row that could match once the
-replicas' copies are merged, and the coordinator filters the merged rows. This keeps rows
-whose matching values were written to different replicas, at the cost of more rows sent to
-the coordinator. A disjunction over wide partitions can therefore reach the replica
-filtering protection limit `replica_filtering_protection.cached_rows_fail_threshold` and
-fail instead of returning incomplete results.
+At a consistency level above `ONE`, on the index path and on the filtering path alike, the
+replicas together return every row that could match once their copies are merged, and the
+coordinator filters the merged rows. On the filtering path a replica sends every row that
+matches one chosen condition of each AND group, preferring a condition that is not on a
+static column. Every node must use the same rule for choosing that condition. A release
+that changes the rule says so in its upgrade notes. For an `OR` query that restricts static
+columns, when a replica's static values for a partition are older than another replica's,
+the coordinator reads that whole partition from it. This keeps rows whose matching values
+were written to different replicas, at the cost of more rows sent to the coordinator. A
+disjunction over wide partitions can therefore reach the replica filtering protection limit
+`replica_filtering_protection.cached_rows_fail_threshold` and fail instead of returning
+incomplete results.
+
+A query without `OR` keeps the Apache Cassandra behaviour: with ALLOW FILTERING at a
+consistency level above `ONE`, it can miss a row whose matching values were written to
+different replicas.
 
 Static columns may appear inside `OR`. One boundary case to know: a partition whose only
 content is a matching static row (no regular rows at all) produces no result row for a

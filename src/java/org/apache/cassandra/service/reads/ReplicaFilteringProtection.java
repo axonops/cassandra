@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.NavigableSet;
+import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.Queue;
 import java.util.function.Function;
@@ -49,6 +50,7 @@ import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
+import org.apache.cassandra.db.rows.ColumnData;
 import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.RangeTombstoneMarker;
 import org.apache.cassandra.db.rows.Row;
@@ -255,9 +257,34 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                     silentRowAt[i] |= silentColumnAt[i] && !allSilent;
             }
 
+            markStaleRestrictedStatics(merged, versions);
+
             for (int i = 0; i < silentRowAt.length; i++)
                 if (silentRowAt[i])
                     builders.get(i).addToFetch(merged);
+        }
+
+        /**
+         * A replica filters rows against its own static row. With a disjunction it keeps rows on one
+         * conjunct, so a replica whose restricted static cells are older than the merged ones may have
+         * dropped rows that match once merged. It is treated as silent on the static row, so the whole
+         * partition is read from it.
+         */
+        private void markStaleRestrictedStatics(Row merged, Row[] versions)
+        {
+            if (!merged.isStatic() || !command.rowFilter().containsDisjunction())
+                return;
+
+            for (RowFilter.Expression e : command.rowFilter().getExpressions())
+            {
+                if (!e.column().isStatic())
+                    continue;
+
+                ColumnData mergedData = merged.getColumnData(e.column());
+                for (int i = 0; i < versions.length; i++)
+                    if (versions[i] != null && !Objects.equals(versions[i].getColumnData(e.column()), mergedData))
+                        silentRowAt[i] = true;
+            }
         }
 
         @Override

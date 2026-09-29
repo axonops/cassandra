@@ -31,6 +31,7 @@ import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.test.TestBaseImpl;
@@ -49,7 +50,8 @@ import static org.apache.cassandra.distributed.shared.AssertUtils.row;
 
 /**
  * OR queries on a 3 node, RF 3 cluster read at ALL and QUORUM, including split matches under several
- * disjunctions and IN re-checked on merged rows: replica filtering protection divergence
+ * disjunctions, the same splits on the filtering path when no index serves the disjunction, and IN
+ * re-checked on merged rows: replica filtering protection divergence
  * where an AND branch under OR matches only the merged row, the strict coordinator re-filter
  * dropping stale local matches, analyzed leaves inside disjunctions, and the cluster version
  * gate refusing OR while a peer speaks the vanilla messaging version.
@@ -392,6 +394,202 @@ public class DisjunctionDistributedTest extends TestBaseImpl
                                                   ConsistencyLevel.ALL));
         assertEquals(ImmutableSet.of(1), valuesAt("SELECT pk FROM %s.nested_split WHERE (a = '1' OR b = '2') AND (c = '1' OR d = '2') AND (e = '1' OR f = '2')",
                                                ConsistencyLevel.ALL));
+    }
+
+    @Test
+    public void disjunctionsSplitAcrossReplicasByFiltering()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.filter_split (pk int, ck int, a text, b text, c text, d text, x text, PRIMARY KEY (pk, ck)) WITH read_repair = 'NONE'"));
+
+        // The three split rows share one partition, so a QUORUM read contacts one replica pair.
+        // Each row holds its newest x = '1' and c = '1' on one node and its newest a = '1' on the next
+        // node, so no replica matches a whole query on its own: ck 10 splits across nodes 1 and 2,
+        // ck 11 across nodes 2 and 3, ck 12 across nodes 3 and 1. Whatever pair QUORUM contacts,
+        // exactly one row has both halves inside it.
+        for (int ck = 10; ck <= 12; ck++)
+        {
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.filter_split (pk, ck, a, b, c, d, x) VALUES (0, ?, '0', '0', '0', '0', '0') USING TIMESTAMP 1"),
+                                           ConsistencyLevel.ALL, ck);
+            CLUSTER.get(ck - 9).executeInternal(withKeyspace("UPDATE %s.filter_split USING TIMESTAMP 2 SET x = '1', c = '1' WHERE pk = 0 AND ck = ?"), ck);
+            CLUSTER.get((ck - 9) % NODES + 1).executeInternal(withKeyspace("UPDATE %s.filter_split USING TIMESTAMP 2 SET a = '1' WHERE pk = 0 AND ck = ?"), ck);
+        }
+
+        // Decoys sort first. Every replica keeps them on x = '1' and the coordinator re-check drops
+        // them, so replica pages fill with rows the coordinator discards and short reads follow
+        for (int ck = 0; ck <= 5; ck++)
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.filter_split (pk, ck, a, b, c, d, x) VALUES (0, ?, '0', '0', '0', '0', '1')"),
+                                           ConsistencyLevel.ALL, ck);
+
+        // Control. Plain AND with ALLOW FILTERING keeps the Apache behaviour. Each replica checks the
+        // whole AND on its own copy, so a row whose matching values sit on different replicas is not
+        // returned. The fork leaves it unchanged, and the assertion makes any change a visible decision.
+        String stock = "SELECT ck FROM %s.filter_split WHERE x = '1' AND a = '1' ALLOW FILTERING";
+        assertEquals(0, CLUSTER.coordinator(1).execute(withKeyspace(stock), ConsistencyLevel.ALL).length);
+        assertEquals(0, CLUSTER.coordinator(1).execute(withKeyspace(stock), ConsistencyLevel.QUORUM).length);
+
+        // Control. The coordinator re-check runs at ONE too
+        String query = "SELECT ck FROM %s.filter_split WHERE x = '1' AND (a = '1' OR b = '2') ALLOW FILTERING";
+        assertEquals(0, CLUSTER.coordinator(1).execute(withKeyspace(query), ConsistencyLevel.ONE).length);
+
+        String disjunctions = "SELECT ck FROM %s.filter_split WHERE (a = '1' OR b = '2') AND (c = '1' OR d = '2') ALLOW FILTERING";
+        for (String select : new String[]{ query, disjunctions })
+        {
+            assertEquals(select, ImmutableSet.of(10, 11, 12), valuesAt(select, ConsistencyLevel.ALL));
+            assertEquals(select, 1, CLUSTER.coordinator(1).execute(withKeyspace(select), ConsistencyLevel.QUORUM).length);
+        }
+
+        for (int pageSize : new int[]{ 1, 2, 100 })
+        {
+            Set<Object> paged = new HashSet<>();
+            int count = 0;
+            Iterator<Object[]> pages = CLUSTER.coordinator(1).executeWithPaging(withKeyspace(query), ConsistencyLevel.ALL, pageSize);
+            while (pages.hasNext())
+            {
+                paged.add(pages.next()[0]);
+                count++;
+            }
+            assertEquals("page size " + pageSize, ImmutableSet.of(10, 11, 12), paged);
+            assertEquals("page size " + pageSize, 3, count);
+        }
+
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT ck FROM %s.filter_split WHERE x = '1' AND (a = '1' OR b = '2') LIMIT 2 ALLOW FILTERING"),
+                                                  ConsistencyLevel.ALL),
+                   row(10), row(11));
+    }
+
+    @Test
+    public void staticConjunctSplitFromDisjunctionByFiltering()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.filter_static (pk int, ck int, s text static, t text static, a text, b text, PRIMARY KEY (pk, ck)) WITH read_repair = 'NONE'"));
+
+        // Static cells belong to the partition, so each case is its own partition, read at ALL.
+        // pk 0 matches only on the merged partition: node 1 holds s, node 2 holds the row
+        CLUSTER.get(1).executeInternal(withKeyspace("UPDATE %s.filter_static SET s = '1' WHERE pk = 0"));
+        CLUSTER.get(2).executeInternal(withKeyspace("UPDATE %s.filter_static SET a = '1' WHERE pk = 0 AND ck = 1"));
+        // pk 1 matches s and neither disjunct on every replica, so it is never a result
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.filter_static (pk, ck, s, a) VALUES (1, 1, '1', '0')"), ConsistencyLevel.ALL);
+        // pk 2: node 1 holds the newest statics and no rows, nodes 2 and 3 hold the row under older statics
+        CLUSTER.get(1).executeInternal(withKeyspace("UPDATE %s.filter_static USING TIMESTAMP 2 SET s = '1', t = '1' WHERE pk = 2"));
+        for (int node = 2; node <= NODES; node++)
+            CLUSTER.get(node).executeInternal(withKeyspace("INSERT INTO %s.filter_static (pk, ck, s, t, a) VALUES (2, 1, '0', '0', '0') USING TIMESTAMP 1"));
+        // pk 3 has matching statics and no rows on any replica
+        CLUSTER.coordinator(1).execute(withKeyspace("UPDATE %s.filter_static SET s = '1', t = '1' WHERE pk = 3"), ConsistencyLevel.ALL);
+        // pk 4: nodes 2 and 3 hold both rows under older statics that still hold every restricted
+        // column, so they are not silent on the static row. Node 1 holds only the newest statics.
+        for (int node = 2; node <= NODES; node++)
+        {
+            CLUSTER.get(node).executeInternal(withKeyspace("INSERT INTO %s.filter_static (pk, ck, s, t, a) VALUES (4, 1, '0', '0', '0') USING TIMESTAMP 1"));
+            CLUSTER.get(node).executeInternal(withKeyspace("INSERT INTO %s.filter_static (pk, ck, a) VALUES (4, 2, '1') USING TIMESTAMP 1"));
+        }
+        CLUSTER.get(1).executeInternal(withKeyspace("UPDATE %s.filter_static USING TIMESTAMP 2 SET s = '1', t = '1' WHERE pk = 4"));
+
+        // Control. Plain AND with ALLOW FILTERING keeps the Apache behaviour. Each replica checks the
+        // whole AND on its own copy, so a row whose matching values sit on different replicas is not
+        // returned. The fork leaves it unchanged, and the assertion makes any change a visible decision.
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk, ck FROM %s.filter_static WHERE s = '1' AND a = '1' ALLOW FILTERING"),
+                                                  ConsistencyLevel.ALL));
+
+        // (0, 1) comes back through the row fetched from node 1, which also returns node 1's static row
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk, ck FROM %s.filter_static WHERE s = '1' AND (a = '1' OR b = '2') ALLOW FILTERING"),
+                                                  ConsistencyLevel.ALL),
+                   row(0, 1), row(4, 2));
+
+        // (2, 1) needs node 1 to return pk 2 with its static row and no rows. (4, 1) needs the whole
+        // partition read from nodes 2 and 3, whose statics are older than node 1's. pk 3 has no row
+        // to return, as the doc states for a partition holding only a matching static row.
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk, ck FROM %s.filter_static WHERE s = '1' AND (t = '1' OR a = '1') ALLOW FILTERING"),
+                                                  ConsistencyLevel.ALL),
+                   row(0, 1), row(2, 1), row(4, 1), row(4, 2));
+
+        // A disjunction with a static leaf and no AND over several columns. Node 1 holds s = '1' with no rows for
+        // pk 0, 2 and 4, and the other replicas hold the rows with no static row or an older one.
+        // pk 1 matches on every replica. pk 3 has no row to return.
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk, ck FROM %s.filter_static WHERE s = '1' OR b = '2' ALLOW FILTERING"),
+                                                  ConsistencyLevel.ALL),
+                   row(1, 1), row(0, 1), row(2, 1), row(4, 1), row(4, 2));
+    }
+
+    @Test
+    public void nestedDisjunctionsSplitAcrossReplicasByFiltering()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.filter_nested (pk int, ck int, a text, b text, c text, d text, e text, x text, PRIMARY KEY (pk, ck)) WITH read_repair = 'NONE'"));
+
+        // One partition, three rows each split across a different pair of nodes, as in
+        // disjunctionsSplitAcrossReplicasByFiltering. Every replica holds x = '1' for every row.
+        for (int ck = 10; ck <= 12; ck++)
+        {
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.filter_nested (pk, ck, a, b, c, d, e, x) VALUES (0, ?, '0', '0', '0', '0', '0', '1') USING TIMESTAMP 1"),
+                                           ConsistencyLevel.ALL, ck);
+            CLUSTER.get(ck - 9).executeInternal(withKeyspace("UPDATE %s.filter_nested USING TIMESTAMP 2 SET a = '1' WHERE pk = 0 AND ck = ?"), ck);
+            CLUSTER.get((ck - 9) % NODES + 1).executeInternal(withKeyspace("UPDATE %s.filter_nested USING TIMESTAMP 2 SET c = '1' WHERE pk = 0 AND ck = ?"), ck);
+        }
+
+        // Control. A conjunction on one column is evaluated in full on each replica
+        assertEquals(ImmutableSet.of(10, 11, 12), valuesAt("SELECT ck FROM %s.filter_nested WHERE (a > '0' AND a < '2') OR e = '5' ALLOW FILTERING",
+                                                           ConsistencyLevel.ALL));
+
+        // The last two put the AND branch under OR under a conjunction with x. In the first of them x
+        // is the conjunct a replica checks, in the second the AND branch is.
+        for (String select : new String[]{ "SELECT ck FROM %s.filter_nested WHERE (a = '1' AND c = '1') OR e = '5' ALLOW FILTERING",
+                                           "SELECT ck FROM %s.filter_nested WHERE ((a = '1' OR b = '2') AND (c = '1' OR d = '2')) OR e = '5' ALLOW FILTERING",
+                                           "SELECT ck FROM %s.filter_nested WHERE ((a = '1' AND c = '1') OR e = '5') AND x = '1' ALLOW FILTERING",
+                                           "SELECT ck FROM %s.filter_nested WHERE ((a = '1' AND c = '1') OR e = '5') AND (x = '1' OR b = '2') ALLOW FILTERING" })
+        {
+            assertEquals(select, ImmutableSet.of(10, 11, 12), valuesAt(select, ConsistencyLevel.ALL));
+            assertEquals(select, 1, CLUSTER.coordinator(1).execute(withKeyspace(select), ConsistencyLevel.QUORUM).length);
+        }
+    }
+
+    @Test
+    public void staticDivergenceUnderDisjunctionOnIndexPath()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.sai_static (pk int, ck int, s text static, t text static, a text, PRIMARY KEY (pk, ck)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX sai_static_t_idx ON %s.sai_static(t) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX sai_static_a_idx ON %s.sai_static(a) USING 'sai'"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        // As pk 4 in staticConjunctSplitFromDisjunctionByFiltering: nodes 2 and 3 hold both rows under
+        // older statics that still hold every restricted column, node 1 holds only the newest statics
+        for (int node = 2; node <= NODES; node++)
+        {
+            CLUSTER.get(node).executeInternal(withKeyspace("INSERT INTO %s.sai_static (pk, ck, s, t, a) VALUES (4, 1, '0', '0', '0') USING TIMESTAMP 1"));
+            CLUSTER.get(node).executeInternal(withKeyspace("INSERT INTO %s.sai_static (pk, ck, a) VALUES (4, 2, '1') USING TIMESTAMP 1"));
+        }
+        CLUSTER.get(1).executeInternal(withKeyspace("UPDATE %s.sai_static USING TIMESTAMP 2 SET s = '1', t = '1' WHERE pk = 4"));
+
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk, ck FROM %s.sai_static WHERE s = '1' AND (t = '1' OR a = '1') ALLOW FILTERING"),
+                                                  ConsistencyLevel.ALL),
+                   row(4, 1), row(4, 2));
+    }
+
+    @Test
+    public void plainAndStaticDivergenceKeepsStockProtectionReads()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.stock_static (pk int, ck int, s text static, t text static, v text, PRIMARY KEY (pk, ck)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX stock_static_s_idx ON %s.stock_static(s) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX stock_static_t_idx ON %s.stock_static(t) USING 'sai'"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        // Every replica's static row differs from the merged one on s or t, and every replica returns
+        // every row under the index union for unrepaired matches, so no replica is silent on any row
+        for (int ck = 1; ck <= 3; ck++)
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.stock_static (pk, ck, s, t, v) VALUES (0, ?, '0', '0', '0') USING TIMESTAMP 1"),
+                                           ConsistencyLevel.ALL, ck);
+        CLUSTER.get(1).executeInternal(withKeyspace("UPDATE %s.stock_static USING TIMESTAMP 2 SET s = '1' WHERE pk = 0"));
+        CLUSTER.get(3).executeInternal(withKeyspace("UPDATE %s.stock_static USING TIMESTAMP 2 SET s = '1' WHERE pk = 0"));
+        CLUSTER.get(2).executeInternal(withKeyspace("UPDATE %s.stock_static USING TIMESTAMP 2 SET t = '1' WHERE pk = 0"));
+
+        long protectionReads = CLUSTER.get(1).callOnInstance(() -> Keyspace.open(KEYSPACE)
+                                                                           .getColumnFamilyStore("stock_static")
+                                                                           .metric.replicaFilteringProtectionRequests.getCount());
+
+        // Control
+        assertEquals(ImmutableSet.of(1, 2, 3), valuesAt("SELECT ck FROM %s.stock_static WHERE s = '1' AND t = '1'", ConsistencyLevel.ALL));
+
+        // Without OR the coordinator reads no extra rows here, as Apache does
+        assertEquals(protectionReads, (long) CLUSTER.get(1).callOnInstance(() -> Keyspace.open(KEYSPACE)
+                                                                                         .getColumnFamilyStore("stock_static")
+                                                                                         .metric.replicaFilteringProtectionRequests.getCount()));
     }
 
     @Test

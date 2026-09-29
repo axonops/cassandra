@@ -21,9 +21,11 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -318,6 +320,9 @@ public class RowFilter implements Iterable<RowFilter.Expression>
      */
     public UnfilteredPartitionIterator filter(UnfilteredPartitionIterator iter, long nowInSec)
     {
+        if (containsDisjunction() && needsReconciliation() && (!isStrict() || hasStaticExpression()))
+            return Transformation.apply(iter, filterOnReplica(iter.metadata(), nowInSec));
+
         return isEmpty() ? iter : Transformation.apply(iter, filter(iter.metadata(), nowInSec));
     }
 
@@ -332,6 +337,65 @@ public class RowFilter implements Iterable<RowFilter.Expression>
     public PartitionIterator filter(PartitionIterator iter, TableMetadata metadata, long nowInSec)
     {
         return isEmpty() ? iter : Transformation.apply(iter, filter(metadata, nowInSec));
+    }
+
+    /**
+     * The replica filter for a filter with a disjunction on a read that needs reconciliation. A replica
+     * may hold only some of the cells a row matches on once the copies are merged, so a conjunction over
+     * several mutable columns keeps a row when its key column expressions and one chosen conjunct match.
+     * A partition whose static row alone satisfies the filter this way is kept with no rows, so replica
+     * filtering protection reads that partition from the other replicas. A filter with a static leaf and
+     * no such conjunction comes here for that reason alone, and its rows are checked as
+     * filter(TableMetadata, long) checks them. The coordinator re-check uses {@link #filter(PartitionIterator, TableMetadata, long)},
+     * which stays strict. Only range reads reach this, since digest reads skip the coordinator re-check.
+     */
+    private Transformation<BaseRowIterator<?>> filterOnReplica(TableMetadata metadata, long nowInSec)
+    {
+        Map<FilterElement, Integer> anchors = new HashMap<>();
+        root.collectAnchors(anchors);
+
+        List<Expression> partitionKeyExpressions = new ArrayList<>();
+        for (Expression e : root.expressions())
+            if (e.column.isPartitionKey())
+                partitionKeyExpressions.add(e);
+
+        return new Transformation<>()
+        {
+            DecoratedKey pk;
+            Row staticRow;
+
+            @Override
+            protected BaseRowIterator<?> applyToPartition(BaseRowIterator<?> partition)
+            {
+                pk = partition.partitionKey();
+                staticRow = partition.staticRow();
+
+                for (Expression e : partitionKeyExpressions)
+                    if (!e.isSatisfiedBy(metadata, pk, staticRow, nowInSec))
+                    {
+                        partition.close();
+                        return null;
+                    }
+
+                BaseRowIterator<?> iterator = partition instanceof UnfilteredRowIterator
+                                              ? Transformation.apply((UnfilteredRowIterator) partition, this)
+                                              : Transformation.apply((RowIterator) partition, this);
+
+                if (!iterator.hasNext() && !root.isSatisfiedByStaticRowOnReplica(anchors, metadata, pk, staticRow, nowInSec))
+                {
+                    iterator.close();
+                    return null;
+                }
+
+                return iterator;
+            }
+
+            @Override
+            public Row applyToRow(Row row)
+            {
+                return root.isSatisfiedByOnReplica(anchors, metadata, pk, row, staticRow, nowInSec) ? row : null;
+            }
+        };
     }
 
     /**
@@ -694,6 +758,117 @@ public class RowFilter implements Iterable<RowFilter.Expression>
             }
 
             return !isDisjunction;
+        }
+
+        void collectAnchors(Map<FilterElement, Integer> anchors)
+        {
+            if (isMutableIntersection())
+                anchors.put(this, anchorIndex());
+
+            for (FilterElement child : children)
+                child.collectAnchors(anchors);
+        }
+
+        /**
+         * The conjunct a replica checks for this node, as an index over the expressions then the children:
+         * the first non key conjunct not only on static columns, else the first non key conjunct. The
+         * order is the serialized tree order, so every replica picks the same one. OR subtrees never hold
+         * key columns.
+         * <p>
+         * Every replica must pick the same anchor for a node, or a row split across two replicas can be
+         * dropped by both. Changing this rule needs a coordinated upgrade.
+         */
+        private int anchorIndex()
+        {
+            int firstStatic = -1;
+            for (int i = 0; i < expressions.size(); i++)
+            {
+                ColumnMetadata column = expressions.get(i).column();
+                if (column.isPrimaryKeyColumn())
+                    continue;
+                if (!column.isStatic())
+                    return i;
+                if (firstStatic < 0)
+                    firstStatic = i;
+            }
+
+            for (int i = 0; i < children.size(); i++)
+            {
+                if (!children.get(i).restrictsOnlyStaticOrPartitionKeyColumns())
+                    return expressions.size() + i;
+                if (firstStatic < 0)
+                    firstStatic = expressions.size() + i;
+            }
+
+            return firstStatic;
+        }
+
+        /**
+         * Replica side evaluation for a read that needs reconciliation. A node with an anchor keeps the row
+         * when its key column expressions and its anchor match. Other nodes evaluate as isSatisfiedBy does,
+         * with their children evaluated by this method.
+         */
+        boolean isSatisfiedByOnReplica(Map<FilterElement, Integer> anchors, TableMetadata metadata, DecoratedKey partitionKey,
+                                       Row row, Row staticRow, long nowInSec)
+        {
+            Integer anchor = anchors.get(this);
+            if (anchor != null)
+            {
+                for (Expression e : expressions)
+                    if (e.column().isPrimaryKeyColumn() && !e.isSatisfiedBy(metadata, partitionKey, row, nowInSec))
+                        return false;
+
+                return anchor < expressions.size()
+                       ? isSatisfiedByLeaf(expressions.get(anchor), metadata, partitionKey, row, staticRow, nowInSec)
+                       : children.get(anchor - expressions.size()).isSatisfiedByOnReplica(anchors, metadata, partitionKey, row, staticRow, nowInSec);
+            }
+
+            for (Expression e : expressions)
+                if (isSatisfiedByLeaf(e, metadata, partitionKey, row, staticRow, nowInSec) == isDisjunction)
+                    return isDisjunction;
+
+            for (FilterElement child : children)
+                if (child.isSatisfiedByOnReplica(anchors, metadata, partitionKey, row, staticRow, nowInSec) == isDisjunction)
+                    return isDisjunction;
+
+            return !isDisjunction;
+        }
+
+        /**
+         * Whether the static row alone satisfies this node the way a replica evaluates it. Clustering
+         * expressions are skipped, they need a row. Partition key ones were checked already. OR subtrees
+         * never hold key columns.
+         */
+        boolean isSatisfiedByStaticRowOnReplica(Map<FilterElement, Integer> anchors, TableMetadata metadata,
+                                                DecoratedKey partitionKey, Row staticRow, long nowInSec)
+        {
+            if (staticRow.isEmpty())
+                return false;
+
+            Integer anchor = anchors.get(this);
+            if (anchor != null && anchor >= expressions.size())
+                return children.get(anchor - expressions.size()).isSatisfiedByOnReplica(anchors, metadata, partitionKey, staticRow, staticRow, nowInSec);
+            if (anchor != null)
+                return expressions.get(anchor).column().isStatic() && expressions.get(anchor).isSatisfiedBy(metadata, partitionKey, staticRow, nowInSec);
+
+            for (Expression e : expressions)
+                if (!e.column().isPrimaryKeyColumn() && !e.isSatisfiedBy(metadata, partitionKey, staticRow, nowInSec))
+                    return false;
+
+            for (FilterElement child : children)
+                if (!child.isSatisfiedByOnReplica(anchors, metadata, partitionKey, staticRow, staticRow, nowInSec))
+                    return false;
+
+            return true;
+        }
+
+        /**
+         * Evaluates one leaf of this node against the static row when it is on a static column, as
+         * isSatisfiedBy does.
+         */
+        private static boolean isSatisfiedByLeaf(Expression e, TableMetadata metadata, DecoratedKey partitionKey, Row row, Row staticRow, long nowInSec)
+        {
+            return e.isSatisfiedBy(metadata, partitionKey, e.column().isStatic() ? staticRow : row, nowInSec);
         }
 
         @Override
