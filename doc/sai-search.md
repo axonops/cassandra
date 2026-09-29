@@ -254,6 +254,13 @@ ALLOW FILTERING and is evaluated by filtering. There is no cost model for unions
 cut, so very unselective disjunctions can materialize large key sets; the standard SAI
 guardrails still apply per predicate.
 
+At a consistency level above `ONE`, a replica keeps every row that could match once the
+replicas' copies are merged, and the coordinator filters the merged rows. This keeps rows
+whose matching values were written to different replicas, at the cost of more rows sent to
+the coordinator. A disjunction over wide partitions can therefore reach the replica
+filtering protection limit `replica_filtering_protection.cached_rows_fail_threshold` and
+fail instead of returning incomplete results.
+
 Static columns may appear inside `OR`. One boundary case to know: a partition whose only
 content is a matching static row (no regular rows at all) produces no result row for a
 disjunction that also restricts regular columns, on the index path and the filtering path

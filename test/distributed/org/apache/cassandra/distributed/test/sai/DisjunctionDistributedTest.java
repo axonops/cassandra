@@ -18,8 +18,14 @@
 
 package org.apache.cassandra.distributed.test.sai;
 
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
+import com.google.common.collect.ImmutableSet;
 import com.google.common.util.concurrent.Uninterruptibles;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -42,7 +48,8 @@ import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
 import static org.apache.cassandra.distributed.shared.AssertUtils.row;
 
 /**
- * OR queries on a 3 node, RF 3 cluster read at ALL: replica filtering protection divergence
+ * OR queries on a 3 node, RF 3 cluster read at ALL and QUORUM, including split matches under several
+ * disjunctions and IN re-checked on merged rows: replica filtering protection divergence
  * where an AND branch under OR matches only the merged row, the strict coordinator re-filter
  * dropping stale local matches, analyzed leaves inside disjunctions, and the cluster version
  * gate refusing OR while a peer speaks the vanilla messaging version.
@@ -181,6 +188,213 @@ public class DisjunctionDistributedTest extends TestBaseImpl
     }
 
     @Test
+    public void disjunctionsSplitAcrossReplicas()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.split (pk int, ck int, a text, b text, c text, d text, PRIMARY KEY (pk, ck)) WITH read_repair = 'NONE'"));
+        for (String column : new String[]{ "a", "b", "c", "d" })
+            CLUSTER.schemaChange(withKeyspace("CREATE INDEX split_" + column + "_idx ON %s.split(" + column + ") USING 'sai'"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        // The three split rows share one partition, so a QUORUM read contacts one replica pair.
+        // Each row holds its newest a = '1' on one node and its newest c = '1' on the next node, so
+        // no replica matches both disjunctions on its own: ck 0 splits across nodes 1 and 2, ck 1
+        // across nodes 2 and 3, ck 2 across nodes 3 and 1. Whatever pair QUORUM contacts, exactly
+        // one row has both halves inside it.
+        for (int ck = 0; ck <= 2; ck++)
+        {
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.split (pk, ck, a, b, c, d) VALUES (0, ?, '0', '0', '0', '0') USING TIMESTAMP 1"),
+                                           ConsistencyLevel.ALL, ck);
+            CLUSTER.get(ck + 1).executeInternal(withKeyspace("UPDATE %s.split USING TIMESTAMP 2 SET a = '1' WHERE pk = 0 AND ck = ?"), ck);
+            CLUSTER.get((ck + 1) % NODES + 1).executeInternal(withKeyspace("UPDATE %s.split USING TIMESTAMP 2 SET c = '1' WHERE pk = 0 AND ck = ?"), ck);
+        }
+
+        // Decoys every replica keeps under the union and the coordinator re-check drops
+        for (int pk = 10; pk <= 15; pk++)
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.split (pk, ck, a, b, c, d) VALUES (?, 0, '1', '0', '0', '0')"),
+                                           ConsistencyLevel.ALL, pk);
+
+        // The same split under a plain AND is kept by the strictness downgrade for unrepaired matches
+        String control = "SELECT ck FROM %s.split WHERE a = '1' AND c = '1'";
+        assertEquals(ImmutableSet.of(0, 1, 2), valuesAt(control, ConsistencyLevel.ALL));
+        assertEquals(1, CLUSTER.coordinator(1).execute(withKeyspace(control), ConsistencyLevel.QUORUM).length);
+
+        String query = "SELECT ck FROM %s.split WHERE (a = '1' OR b = '2') AND (c = '1' OR d = '2')";
+        assertEquals(ImmutableSet.of(0, 1, 2), valuesAt(query, ConsistencyLevel.ALL));
+        assertEquals(1, CLUSTER.coordinator(1).execute(withKeyspace(query), ConsistencyLevel.QUORUM).length);
+
+        for (int pageSize : new int[]{ 1, 2, 100 })
+        {
+            Set<Object> paged = new HashSet<>();
+            int count = 0;
+            Iterator<Object[]> pages = CLUSTER.coordinator(1).executeWithPaging(withKeyspace(query), ConsistencyLevel.ALL, pageSize);
+            while (pages.hasNext())
+            {
+                paged.add(pages.next()[0]);
+                count++;
+            }
+            assertEquals("page size " + pageSize, ImmutableSet.of(0, 1, 2), paged);
+            assertEquals("page size " + pageSize, 3, count);
+        }
+    }
+
+    @Test
+    public void unindexedConjunctNextToSplitDisjunction()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.unindexed_split (pk int, ck int, a text, b text, x text, PRIMARY KEY (pk, ck)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX unindexed_split_a_idx ON %s.unindexed_split(a) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX unindexed_split_b_idx ON %s.unindexed_split(b) USING 'sai'"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        // One partition, three rows each split across a different pair of nodes, as in disjunctionsSplitAcrossReplicas
+        for (int ck = 0; ck <= 2; ck++)
+        {
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.unindexed_split (pk, ck, a, b, x) VALUES (0, ?, '0', '0', '0') USING TIMESTAMP 1"),
+                                           ConsistencyLevel.ALL, ck);
+            CLUSTER.get(ck + 1).executeInternal(withKeyspace("UPDATE %s.unindexed_split USING TIMESTAMP 2 SET x = '1' WHERE pk = 0 AND ck = ?"), ck);
+            CLUSTER.get((ck + 1) % NODES + 1).executeInternal(withKeyspace("UPDATE %s.unindexed_split USING TIMESTAMP 2 SET a = '1' WHERE pk = 0 AND ck = ?"), ck);
+        }
+
+        // The ONE assertions are controls only: the coordinator re-check runs at ONE too
+        String control = "SELECT ck FROM %s.unindexed_split WHERE x = '1' AND a = '1' ALLOW FILTERING";
+        assertEquals(ImmutableSet.of(0, 1, 2), valuesAt(control, ConsistencyLevel.ALL));
+        assertEquals(1, CLUSTER.coordinator(1).execute(withKeyspace(control), ConsistencyLevel.QUORUM).length);
+        assertEquals(0, CLUSTER.coordinator(1).execute(withKeyspace(control), ConsistencyLevel.ONE).length);
+
+        String query = "SELECT ck FROM %s.unindexed_split WHERE x = '1' AND (a = '1' OR b = '2') ALLOW FILTERING";
+        assertEquals(ImmutableSet.of(0, 1, 2), valuesAt(query, ConsistencyLevel.ALL));
+        assertEquals(1, CLUSTER.coordinator(1).execute(withKeyspace(query), ConsistencyLevel.QUORUM).length);
+        assertEquals(0, CLUSTER.coordinator(1).execute(withKeyspace(query), ConsistencyLevel.ONE).length);
+    }
+
+    @Test
+    public void splitDisjunctionAfterRepair()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.repaired_split (pk int PRIMARY KEY, level text, a text, b text, x text) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX repaired_split_level_idx ON %s.repaired_split(level) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX repaired_split_a_idx ON %s.repaired_split(a) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX repaired_split_b_idx ON %s.repaired_split(b) USING 'sai'"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        // level is repaired on every replica, so its match never marks the read as holding
+        // unrepaired matches
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.repaired_split (pk, level) VALUES (0, '3')"), ConsistencyLevel.ALL);
+        CLUSTER.forEach(instance -> instance.flush(KEYSPACE));
+        CLUSTER.get(1).nodetoolResult("repair", KEYSPACE, "repaired_split").asserts().success();
+
+        CLUSTER.get(1).executeInternal(withKeyspace("UPDATE %s.repaired_split SET x = '1' WHERE pk = 0"));
+        CLUSTER.get(2).executeInternal(withKeyspace("UPDATE %s.repaired_split SET a = '1' WHERE pk = 0"));
+
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.repaired_split WHERE level = '3' AND x = '1' AND a = '1' ALLOW FILTERING"),
+                                                  ConsistencyLevel.ALL),
+                   row(0));
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.repaired_split WHERE level = '3' AND x = '1' AND (a = '1' OR b = '2') ALLOW FILTERING"),
+                                                  ConsistencyLevel.ALL),
+                   row(0));
+    }
+
+    @Test
+    public void analyzedSplitDisjunctionsDropStaleMatch()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.analyzed_split (pk int PRIMARY KEY, body text, b text, c text, d text) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX analyzed_split_body_idx ON %s.analyzed_split(body) USING 'sai' " +
+                                          "WITH OPTIONS = { 'index_analyzer' : 'standard' }"));
+        for (String column : new String[]{ "b", "c", "d" })
+            CLUSTER.schemaChange(withKeyspace("CREATE INDEX analyzed_split_" + column + "_idx ON %s.analyzed_split(" + column + ") USING 'sai'"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        // pk 0 matches only on the merged row
+        CLUSTER.get(1).executeInternal(withKeyspace("UPDATE %s.analyzed_split SET body = 'quick fox' WHERE pk = 0"));
+        CLUSTER.get(2).executeInternal(withKeyspace("UPDATE %s.analyzed_split SET c = '1' WHERE pk = 0"));
+        // pk 10 matches only on node 1's stale data, the merged row has c = '9'
+        CLUSTER.get(1).executeInternal(withKeyspace("UPDATE %s.analyzed_split USING TIMESTAMP 1 SET body = 'quick fox', c = '1' WHERE pk = 10"));
+        CLUSTER.get(2).executeInternal(withKeyspace("UPDATE %s.analyzed_split USING TIMESTAMP 2 SET c = '9' WHERE pk = 10"));
+
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk FROM %s.analyzed_split WHERE (body MATCH 'quick' OR b = '2') AND (c = '1' OR d = '2')"),
+                                                  ConsistencyLevel.ALL),
+                   row(0));
+    }
+
+    @Test
+    public void inIsRecheckedOnMergedRowsUnderDisjunction()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.in_recheck (pk int, ck int, t text, PRIMARY KEY (pk, ck)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX in_recheck_t_idx ON %s.in_recheck(t) USING 'sai' WITH OPTIONS = { 'case_sensitive' : false }"));
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.in_recheck_plain (pk int, ck int, t text, PRIMARY KEY (pk, ck)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX in_recheck_plain_t_idx ON %s.in_recheck_plain(t) USING 'sai'"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        // One partition. Each of ck 0 to 2 has a stale t = 'x' on one node and the newest t = 'y',
+        // which the IN rejects, on the other two, so every replica pair holds a stale replica for
+        // some row. ck 20 is 'x' everywhere.
+        for (String table : new String[]{ "in_recheck", "in_recheck_plain" })
+        {
+            for (int ck = 0; ck <= 2; ck++)
+            {
+                for (int node = 1; node <= NODES; node++)
+                {
+                    String value = node == ck + 1 ? "x" : "y";
+                    long timestamp = node == ck + 1 ? 1 : 2;
+                    CLUSTER.get(node).executeInternal(withKeyspace("INSERT INTO %s." + table + " (pk, ck, t) VALUES (0, ?, ?) USING TIMESTAMP " + timestamp), ck, value);
+                }
+            }
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s." + table + " (pk, ck, t) VALUES (0, 20, 'x')"), ConsistencyLevel.ALL);
+        }
+
+        for (ConsistencyLevel cl : new ConsistencyLevel[]{ ConsistencyLevel.QUORUM, ConsistencyLevel.ALL })
+        {
+            // Without an analyzer the coordinator re-check applies the whole row filter, IN included
+            assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT ck FROM %s.in_recheck_plain WHERE t IN ('a', 'x') AND (t = 'x' OR t = 'y') ALLOW FILTERING"), cl),
+                       row(20));
+            assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT ck FROM %s.in_recheck WHERE t IN ('a', 'x') AND (t = 'x' OR t = 'y') ALLOW FILTERING"), cl),
+                       row(20));
+            // The disjunction matches through the index analyzer, the IN compares raw values
+            assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT ck FROM %s.in_recheck WHERE t IN ('a', 'x') AND (t = 'X' OR t = 'Y') ALLOW FILTERING"), cl),
+                       row(20));
+        }
+    }
+
+    @Test
+    public void staticConjunctNextToSplitDisjunction()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.static_split (pk int, ck int, s text static, a text, b text, PRIMARY KEY (pk, ck)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX static_split_a_idx ON %s.static_split(a) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX static_split_b_idx ON %s.static_split(b) USING 'sai'"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        // pk 0 matches only on the merged partition
+        CLUSTER.get(1).executeInternal(withKeyspace("UPDATE %s.static_split SET s = '1' WHERE pk = 0"));
+        CLUSTER.get(2).executeInternal(withKeyspace("UPDATE %s.static_split SET a = '1' WHERE pk = 0 AND ck = 1"));
+        // pk 1 matches the disjunction but not the static, on every replica: replicas keep it under
+        // the union and the coordinator re-check drops it
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.static_split (pk, ck, s, a) VALUES (1, 1, '0', '1')"), ConsistencyLevel.ALL);
+
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT pk, ck FROM %s.static_split WHERE s = '1' AND (a = '1' OR b = '2') ALLOW FILTERING"),
+                                                  ConsistencyLevel.ALL),
+                   row(0, 1));
+    }
+
+    @Test
+    public void nestedDisjunctionsSplitAcrossReplicas()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.nested_split (pk int PRIMARY KEY, a text, b text, c text, d text, e text, f text) WITH read_repair = 'NONE'"));
+        for (String column : new String[]{ "a", "b", "c", "d", "e", "f" })
+            CLUSTER.schemaChange(withKeyspace("CREATE INDEX nested_split_" + column + "_idx ON %s.nested_split(" + column + ") USING 'sai'"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        for (int pk = 0; pk <= 1; pk++)
+        {
+            CLUSTER.get(1).executeInternal(withKeyspace("UPDATE %s.nested_split SET a = '1' WHERE pk = ?"), pk);
+            CLUSTER.get(2).executeInternal(withKeyspace("UPDATE %s.nested_split SET c = '1' WHERE pk = ?"), pk);
+        }
+        CLUSTER.get(3).executeInternal(withKeyspace("UPDATE %s.nested_split SET e = '1' WHERE pk = 1"));
+
+        assertEquals(ImmutableSet.of(0, 1), valuesAt("SELECT pk FROM %s.nested_split WHERE ((a = '1' OR b = '2') AND (c = '1' OR d = '2')) OR e = '5'",
+                                                  ConsistencyLevel.ALL));
+        assertEquals(ImmutableSet.of(1), valuesAt("SELECT pk FROM %s.nested_split WHERE (a = '1' OR b = '2') AND (c = '1' OR d = '2') AND (e = '1' OR f = '2')",
+                                               ConsistencyLevel.ALL));
+    }
+
+    @Test
     public void orIsRefusedWhileAPeerSpeaksTheVanillaVersion()
     {
         CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.gate (pk int PRIMARY KEY, a int, b int) WITH read_repair = 'NONE'"));
@@ -231,6 +445,17 @@ public class DisjunctionDistributedTest extends TestBaseImpl
     private static int countAtAll(String select)
     {
         return CLUSTER.coordinator(1).execute(withKeyspace(select), ConsistencyLevel.ALL).length;
+    }
+
+    /**
+     * @return the first selected column of every row, checking that no row is returned twice
+     */
+    private static Set<Object> valuesAt(String select, ConsistencyLevel cl)
+    {
+        Object[][] rows = CLUSTER.coordinator(1).execute(withKeyspace(select), cl);
+        Set<Object> values = Arrays.stream(rows).map(row -> row[0]).collect(Collectors.toSet());
+        assertEquals("duplicate rows in " + Arrays.deepToString(rows), rows.length, values.size());
+        return values;
     }
 
     /**

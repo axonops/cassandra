@@ -119,6 +119,9 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
     @Override
     public PartitionIterator filterReplicaFilteringProtection(PartitionIterator fullResponse)
     {
+        if (queryController.indexFilter().containsDisjunction())
+            return filterDisjunctionReplicaFilteringProtection(fullResponse);
+
         for (RowFilter.Expression expression : queryController.indexFilter())
         {
             if (queryController.hasAnalyzer(expression))
@@ -126,6 +129,27 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         }
 
         // if no analyzer does transformation
+        return Index.Searcher.super.filterReplicaFilteringProtection(fullResponse);
+    }
+
+    /**
+     * The coordinator re-check for a filter with a disjunction. The index filter leaves out IN and user
+     * defined root expressions, and each replica applies them through the plan's post index filter.
+     * When the filter tree re-checks the merged rows, the post index filter is applied to them too, or a
+     * stale replica's match on those expressions would be returned.
+     */
+    private PartitionIterator filterDisjunctionReplicaFilteringProtection(PartitionIterator fullResponse)
+    {
+        for (RowFilter.Expression expression : queryController.indexFilter())
+        {
+            if (queryController.hasAnalyzer(expression))
+            {
+                PartitionIterator filtered = applyIndexFilter(fullResponse, Operation.buildFilter(queryController, true), queryContext);
+                RowFilter postIndexFilter = command.indexQueryPlan().postIndexQueryFilter();
+                return postIndexFilter.filter(filtered, command.metadata(), command.nowInSec());
+            }
+        }
+
         return Index.Searcher.super.filterReplicaFilteringProtection(fullResponse);
     }
 

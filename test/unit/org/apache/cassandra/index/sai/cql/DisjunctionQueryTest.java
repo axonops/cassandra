@@ -17,7 +17,9 @@
  */
 package org.apache.cassandra.index.sai.cql;
 
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 
 import org.junit.Before;
@@ -25,11 +27,22 @@ import org.junit.Test;
 
 import com.datastax.driver.core.Row;
 import com.datastax.driver.core.Session;
+import com.google.common.collect.ImmutableSet;
+import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
 import org.apache.cassandra.cql3.statements.SelectStatement;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.PartitionRangeReadCommand;
 import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.ReadExecutionController;
+import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.rows.RowIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.utils.FBUtilities;
@@ -307,5 +320,93 @@ public class DisjunctionQueryTest extends SAITester
         assertNotNull(trace);
         assertTrue(trace, trace.contains("OrNode"));
         assertTrue(trace, trace.contains("AndNode"));
+    }
+
+    @Test
+    public void replicaKeepsRowsMatchingOneOfSeveralDisjunctions() throws Throwable
+    {
+        // RF 3 on this single node makes a QUORUM read need reconciliation, so the replica
+        // evaluates each conjunction that intersects several columns non strictly
+        String keyspace = createKeyspace("CREATE KEYSPACE %s WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 3 }");
+        String table = keyspace + '.' + createTable(keyspace, "CREATE TABLE %s (pk int PRIMARY KEY, a text, b text, c text, d text, x text)");
+        for (String column : new String[]{ "a", "b", "c", "d" })
+            createIndex(keyspace, "CREATE INDEX ON %s(" + column + ") USING 'sai'");
+
+        // No row matches a whole query. pk 0 matches (a = '1' OR b = '2') only, pk 1 matches it but not x = '1'
+        execute("INSERT INTO " + table + " (pk, a, c) VALUES (0, '1', '0')");
+        execute("INSERT INTO " + table + " (pk, x, a) VALUES (1, '0', '1')");
+
+        String disjunctions = "SELECT pk FROM " + table + " WHERE (a = '1' OR b = '2') AND (c = '1' OR d = '2')";
+        String unindexed = "SELECT pk FROM " + table + " WHERE x = '1' AND (a = '1' OR b = '2') ALLOW FILTERING";
+
+        // A read at ONE needs no reconciliation, so the replica stays strict and returns nothing
+        assertEmpty(execute(disjunctions));
+        assertEmpty(execute(unindexed));
+
+        QueryOptions quorum = QueryOptions.forInternalCalls(ConsistencyLevel.QUORUM, Collections.emptyList());
+        for (String query : new String[]{ disjunctions, unindexed })
+        {
+            SelectStatement select = (SelectStatement) QueryProcessor.getStatement(query, ClientState.forInternalCalls());
+            ReadCommand command = (ReadCommand) select.getQuery(quorum, FBUtilities.nowInSeconds());
+            Set<Integer> kept = new HashSet<>();
+            try (ReadExecutionController controller = command.executionController();
+                 UnfilteredPartitionIterator partitions = command.executeLocally(controller))
+            {
+                while (partitions.hasNext())
+                {
+                    try (UnfilteredRowIterator partition = partitions.next())
+                    {
+                        if (partition.hasNext())
+                            kept.add(Int32Type.instance.compose(partition.partitionKey().getKey()));
+                    }
+                }
+            }
+            // The replica keeps a row matching any one conjunct, the coordinator re-check filters it
+            assertEquals(query, ImmutableSet.of(0, 1), kept);
+        }
+    }
+
+    @Test
+    public void inIsRecheckedUnderReplicaFilteringProtectionWithDisjunction() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, t text)");
+        createIndex("CREATE INDEX ON %s(t) USING 'sai' WITH OPTIONS = { 'case_sensitive' : false }");
+
+        execute("INSERT INTO %s (pk, t) VALUES (0, 'y')");
+        execute("INSERT INTO %s (pk, t) VALUES (1, 'x')");
+
+        String withIn = "SELECT pk FROM %s WHERE t IN ('a', 'x') AND (t = 'X' OR t = 'Y') ALLOW FILTERING";
+        String withoutIn = "SELECT pk FROM %s WHERE t = 'X' OR t = 'Y'";
+        for (String query : new String[]{ withoutIn, withIn })
+        {
+            SelectStatement select = (SelectStatement) QueryProcessor.getStatement(formatQuery(query), ClientState.forInternalCalls());
+            ReadCommand command = (ReadCommand) select.getQuery(QueryOptions.DEFAULT, FBUtilities.nowInSeconds());
+
+            if (query.equals(withIn))
+            {
+                // The post index filter holds exactly the root IN, which the index filter leaves out
+                List<RowFilter.Expression> post = command.indexQueryPlan().postIndexQueryFilter().getExpressions();
+                assertEquals(post.toString(), 1, post.size());
+                assertEquals(Operator.IN, post.get(0).operator());
+                assertEquals("t", post.get(0).column().name.toString());
+            }
+
+            // Every row of the table, as the merged rows reach the coordinator re-check
+            PartitionRangeReadCommand allData = PartitionRangeReadCommand.allDataRead(getCurrentColumnFamilyStore().metadata(), FBUtilities.nowInSeconds());
+            Set<Integer> kept = new HashSet<>();
+            try (ReadExecutionController controller = allData.executionController();
+                 PartitionIterator partitions = command.indexSearcher().filterReplicaFilteringProtection(allData.executeInternal(controller)))
+            {
+                while (partitions.hasNext())
+                {
+                    try (RowIterator partition = partitions.next())
+                    {
+                        if (partition.hasNext())
+                            kept.add(Int32Type.instance.compose(partition.partitionKey().getKey()));
+                    }
+                }
+            }
+            assertEquals(query, query.equals(withIn) ? ImmutableSet.of(1) : ImmutableSet.of(0, 1), kept);
+        }
     }
 }

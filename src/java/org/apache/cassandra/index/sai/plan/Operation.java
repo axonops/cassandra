@@ -116,6 +116,11 @@ public class Operation
         {
             return unindexedColumns.size() > 1;
         }
+
+        int unindexedColumnCount()
+        {
+            return unindexedColumns.size();
+        }
     }
 
     @VisibleForTesting
@@ -601,7 +606,32 @@ public class Operation
         @Override
         FilterTree filterTree(boolean forceStrict, QueryContext context)
         {
+            if (needsUnionOnReplica(forceStrict))
+                return new FilterTree(BooleanOperator.OR, expressions, true, context);
+
             return new FilterTree(BooleanOperator.AND, expressions, forceStrict || strict, context);
+        }
+
+        /**
+         * A disjunction child is searched strictly, so its matches never set
+         * {@link QueryContext#hasUnrepairedMatches}. Like an unindexed column it is a conjunct whose match
+         * does not mark the read as holding unrepaired matches. When a node has a disjunction child and two or more such
+         * conjuncts, their newest matching values can sit on different replicas. The replica then keeps
+         * a row that satisfies any one conjunct, and the coordinator re-check filters the merged row
+         * strictly. Never applies to strict nodes, to the coordinator re-check, or to a node without a
+         * disjunction child.
+         */
+        private boolean needsUnionOnReplica(boolean forceStrict)
+        {
+            if (forceStrict || strict)
+                return false;
+
+            int disjunctions = 0;
+            for (Node child : children)
+                if (child instanceof OrNode)
+                    disjunctions++;
+
+            return disjunctions > 0 && disjunctions + expressions.unindexedColumnCount() >= 2;
         }
 
         @Override
