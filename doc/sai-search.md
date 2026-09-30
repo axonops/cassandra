@@ -328,8 +328,10 @@ incomplete results.
 A read that waits for one replica filters strictly on it, as at `ONE`. That is `ONE`,
 `LOCAL_ONE` and `NODE_LOCAL`, any level on a keyspace with a replication factor of 1, and
 `LOCAL_QUORUM` or `LOCAL_SERIAL` in a data center that holds one replica of the keyspace. Such a
-read sends no extra rows, and it accepts an `IN` restriction next to `OR`, as `ONE` does. The
-intersect filtering guardrail still applies to it as to any read above `ONE`.
+read sends no extra rows. An `IN` restriction next to `OR` follows the usual rule for `IN` whatever
+the number of replicas the read waits for. At `LOCAL_QUORUM` or `LOCAL_SERIAL` in such a data center
+it is refused whenever the same query without `OR` is refused. The intersect filtering guardrail
+applies to such a read as to any read above `ONE`.
 
 A query without `OR` that uses ALLOW FILTERING and no index gets the same protection. At a
 consistency level that waits for two or more replicas, each replica sends every row that

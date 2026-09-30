@@ -146,6 +146,23 @@ public class DisjunctionMultiDcDistributedTest extends TestBaseImpl
             assertTrue(e.getMessage(), e.getMessage().contains("is only supported in intersections for reads that do not require replica reconciliation"));
         }
 
+        // Control. The same IN without OR is refused on the one local replica, because the filter is not strict
+        // there: it intersects two regular columns under reconciliation, as in Apache Cassandra. The assertion
+        // makes any change a visible decision.
+        String stockIn = "SELECT ck FROM %s.local_split WHERE b IN ('0', '5') AND a = '1' ALLOW FILTERING";
+        for (ConsistencyLevel cl : new ConsistencyLevel[]{ ConsistencyLevel.LOCAL_QUORUM, ConsistencyLevel.LOCAL_SERIAL })
+        {
+            try
+            {
+                CLUSTER.coordinator(1).execute(withKeyspace(stockIn), cl);
+                fail("IN without OR should be refused at " + cl);
+            }
+            catch (RuntimeException e)
+            {
+                assertTrue(e.getMessage(), e.getMessage().contains("is only supported in intersections for reads that do not require replica reconciliation"));
+            }
+        }
+
         // The one local replica filters strictly, as at ONE, so decoys never fill a page
         for (ConsistencyLevel cl : new ConsistencyLevel[]{ ConsistencyLevel.LOCAL_QUORUM, ConsistencyLevel.LOCAL_SERIAL })
         {
@@ -157,8 +174,28 @@ public class DisjunctionMultiDcDistributedTest extends TestBaseImpl
         assertRows(CLUSTER.coordinator(1).execute(withKeyspace(query + " LIMIT 2"), ConsistencyLevel.LOCAL_QUORUM),
                    row(10), row(11));
 
-        // IN next to OR is accepted where the read filters strictly, as at ONE
-        assertEquals(ImmutableSet.of(0, 1, 2, 3, 4, 5, 10, 11, 12), valuesAt(in, ConsistencyLevel.LOCAL_QUORUM));
+        // A condition next to OR that is not IN is accepted there too, and decoys matching only a = '1' never fill a page
+        String equality = "SELECT ck FROM %s.local_split WHERE a = '1' AND (c = '1' OR d = '2')";
+        for (ConsistencyLevel cl : new ConsistencyLevel[]{ ConsistencyLevel.LOCAL_QUORUM, ConsistencyLevel.LOCAL_SERIAL })
+        {
+            for (int pageSize : new int[]{ 1, 2, 100 })
+                assertEquals(cl + " page size " + pageSize, ImmutableSet.of(10, 11, 12), pagedValuesAt(equality, cl, pageSize));
+        }
+
+        // IN next to OR is refused on the one local replica as the same IN without OR is, since whether a query
+        // is accepted depends on the consistency level and the replication factor, not on how many replicas it reads
+        for (ConsistencyLevel cl : new ConsistencyLevel[]{ ConsistencyLevel.LOCAL_QUORUM, ConsistencyLevel.LOCAL_SERIAL })
+        {
+            try
+            {
+                CLUSTER.coordinator(1).execute(withKeyspace(in), cl);
+                fail("IN next to OR should be refused at " + cl);
+            }
+            catch (RuntimeException e)
+            {
+                assertTrue(e.getMessage(), e.getMessage().contains("is only supported in intersections for reads that do not require replica reconciliation"));
+            }
+        }
     }
 
     @Test
@@ -214,6 +251,14 @@ public class DisjunctionMultiDcDistributedTest extends TestBaseImpl
         assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT ck FROM %s.local_filter WHERE x = '1' AND (a = '1' OR b = '2') LIMIT 2 ALLOW FILTERING"),
                                                   ConsistencyLevel.LOCAL_QUORUM),
                    row(10), row(11));
+
+        // With no index nothing refuses IN, so IN next to OR runs and the one local replica filters it strictly too
+        String in = "SELECT ck FROM %s.local_filter WHERE x IN ('1', '5') AND (a = '1' OR b = '2') ALLOW FILTERING";
+        for (ConsistencyLevel cl : new ConsistencyLevel[]{ ConsistencyLevel.LOCAL_QUORUM, ConsistencyLevel.LOCAL_SERIAL })
+        {
+            for (int pageSize : new int[]{ 1, 2, 100 })
+                assertEquals(cl + " IN page size " + pageSize, ImmutableSet.of(10, 11, 12), pagedValuesAt(in, cl, pageSize));
+        }
     }
 
     @Test

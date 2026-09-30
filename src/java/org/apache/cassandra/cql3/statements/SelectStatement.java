@@ -1000,7 +1000,14 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
         // so the replica filters strictly.
         if (filter.containsDisjunction() && filter.needsReconciliation() &&
             !RowFilter.resolvesTwoOrMoreReplicas(options.getConsistency(), Keyspace.open(table.keyspace).getReplicationStrategy()))
+        {
+            // SAI refuses IN or a user expression in a filter that is not strict. Plan the filter as built for this
+            // consistency level before the copy, so the query is refused as without OR, whatever the number of replicas the read waits for.
+            if (Iterables.any(filter.root().expressions(), e -> e.operator().isIN() || e.isUserDefined()))
+                Keyspace.openAndGetStore(table).indexManager.getBestIndexQueryPlanFor(filter);
+
             filter = filter.withoutReconciliation();
+        }
 
         // With no index, replicas may send partial matches and the coordinator filters the merged rows
         if (!filter.isStrict())
