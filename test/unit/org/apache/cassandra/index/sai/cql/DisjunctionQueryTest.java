@@ -23,6 +23,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
+import javax.management.ObjectName;
 
 import org.junit.Before;
 import org.junit.Test;
@@ -32,6 +34,7 @@ import com.datastax.driver.core.Session;
 import com.datastax.driver.core.exceptions.InvalidQueryException;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.QueryProcessor;
@@ -50,6 +53,9 @@ import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.RowIterator;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.index.sai.SAITester;
+import org.apache.cassandra.index.sai.StorageAttachedIndexGroup;
+import org.apache.cassandra.index.sai.metrics.TableQueryMetrics;
+import org.apache.cassandra.index.sai.plan.StorageAttachedIndexQueryPlan;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.FBUtilities;
@@ -841,5 +847,455 @@ public class DisjunctionQueryTest extends SAITester
                 mergedRefusals.add(event.getString("activity"));
         }
         assertEquals(List.of(), mergedRefusals);
+    }
+
+    @Test
+    public void sasiLikeNextToAnalyzedDisjunctionIsApplied() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, s text, a int, b int, c text)");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'org.apache.cassandra.index.sasi.SASIIndex' WITH OPTIONS = { 'mode' : 'PREFIX' }");
+        createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(b) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(c) USING 'sai' WITH OPTIONS = { 'case_sensitive' : false }");
+
+        execute("INSERT INTO %s (pk, s, a, b, c) VALUES (1, 'abcdef', 1, 9, 'z')");
+        execute("INSERT INTO %s (pk, s, a, b, c) VALUES (2, 'zzz', 1, 9, 'z')");
+        execute("INSERT INTO %s (pk, s, a, b, c) VALUES (3, 'abcxyz', 9, 2, 'Q')");
+        execute("INSERT INTO %s (pk, s, a, b, c) VALUES (4, 'qqq', 9, 2, 'q')");
+        execute("INSERT INTO %s (pk, s, a, b, c) VALUES (5, 'abc1', 9, 9, 'z')");
+        execute("INSERT INTO %s (pk, s, a, b, c) VALUES (6, 'qqq', 9, 9, 'z')");
+
+        String query = "SELECT pk FROM %s WHERE s LIKE 'abc%%' AND (a = 1 OR c = 'q') ALLOW FILTERING";
+        beforeAndAfterFlush(() -> {
+            // Controls. The SASI index alone and the OR alone
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE s LIKE 'abc%%'"),
+                                    row(1), row(3), row(5));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE a = 1 OR c = 'q'"),
+                                    row(1), row(2), row(3), row(4));
+
+            // The case insensitive index makes the coordinator check the merged rows with the SAI filter tree,
+            // which has no LIKE. At RF 1 the replica filter is strict and removes rows 2 and 4 itself.
+            assertRowsIgnoringOrder(execute(query),
+                                    row(1), row(3));
+            assertEquals(ImmutableSet.of(1, 3), executeNet(getDefaultVersion(), ConsistencyLevel.ONE, query).all().stream()
+                                                                                                     .map(fetched -> fetched.getInt("pk"))
+                                                                                                     .collect(Collectors.toSet()));
+        });
+    }
+
+    @Test
+    public void sasiLikeNextToPlainDisjunctionIsAppliedOnTheReplica() throws Throwable
+    {
+        for (String mode : new String[]{ "PREFIX", "CONTAINS" })
+        {
+            createTable("CREATE TABLE %s (pk int PRIMARY KEY, s text, a int, b int)");
+            createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'org.apache.cassandra.index.sasi.SASIIndex' WITH OPTIONS = { 'mode' : '" + mode + "' }");
+            createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+            createIndex("CREATE INDEX ON %s(b) USING 'sai'");
+
+            execute("INSERT INTO %s (pk, s, a, b) VALUES (1, 'abcdef', 1, 9)");
+            execute("INSERT INTO %s (pk, s, a, b) VALUES (2, 'zzz', 1, 9)");
+            execute("INSERT INTO %s (pk, s, a, b) VALUES (3, 'abcxyz', 9, 2)");
+            execute("INSERT INTO %s (pk, s, a, b) VALUES (4, 'qqq', 9, 2)");
+            execute("INSERT INTO %s (pk, s, a, b) VALUES (5, 'abc1', 9, 9)");
+            execute("INSERT INTO %s (pk, s, a, b) VALUES (6, 'qqq', 9, 9)");
+
+            String query = "SELECT pk FROM %s WHERE s LIKE 'abc%%' AND (a = 1 OR b = 2) ALLOW FILTERING";
+            beforeAndAfterFlush(() -> {
+                // Guard. Clients get the LIKE applied by the coordinator check of the whole row filter
+                assertEquals(mode, ImmutableSet.of(1, 3), executeNet(getDefaultVersion(), ConsistencyLevel.ONE, query).all().stream()
+                                                                                                             .map(fetched -> fetched.getInt("pk"))
+                                                                                                             .collect(Collectors.toSet()));
+                // An internal read has no coordinator check, so the replica applies the LIKE
+                assertRowsIgnoringOrder(execute(query),
+                                        row(1), row(3));
+                assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (a = 1 OR b = 2) AND s LIKE 'abc%%' ALLOW FILTERING"),
+                                        row(1), row(3));
+            });
+        }
+    }
+
+    @Test
+    public void sasiLikeWithoutWildcardMeansEqualityOnTheIndexPath() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, s text, a int, b int)");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'org.apache.cassandra.index.sasi.SASIIndex' WITH OPTIONS = { 'mode' : 'PREFIX' }");
+        createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(b) USING 'sai'");
+
+        execute("INSERT INTO %s (pk, s, a, b) VALUES (1, 'abc', 1, 9)");
+        execute("INSERT INTO %s (pk, s, a, b) VALUES (2, 'xabcx', 1, 9)");
+        execute("INSERT INTO %s (pk, s, a, b) VALUES (3, 'abc', 9, 9)");
+
+        String query = "SELECT pk FROM %s WHERE s LIKE 'abc' AND (a = 1 OR b = 2) ALLOW FILTERING";
+        beforeAndAfterFlush(() -> {
+            // Control. The SASI index reads a LIKE without a wildcard as equality
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE s LIKE 'abc'"),
+                                    row(1), row(3));
+
+            assertRowsIgnoringOrder(execute(query),
+                                    row(1));
+            assertEquals(ImmutableSet.of(1), executeNet(getDefaultVersion(), ConsistencyLevel.ONE, query).all().stream()
+                                                                                                  .map(fetched -> fetched.getInt("pk"))
+                                                                                                  .collect(Collectors.toSet()));
+        });
+
+        // The read command carries the condition as equality
+        SelectStatement select = (SelectStatement) QueryProcessor.getStatement(formatQuery(query), ClientState.forInternalCalls());
+        ReadCommand command = (ReadCommand) select.getQuery(QueryOptions.DEFAULT, FBUtilities.nowInSeconds());
+        assertTrue(command.toCQLString(), command.toCQLString().contains("s = 'abc'"));
+    }
+
+    @Test
+    public void sasiLikeWithoutWildcardIsExactNextToValueChangingSaiIndex() throws Throwable
+    {
+        // An SAI index on s that changes values must not answer the LIKE, which means exact equality to the
+        // SASI index that keeps values as they are
+        for (String options : new String[]{ "{ 'case_sensitive' : false }",
+                                            "{ 'index_analyzer' : 'standard' }",
+                                            "{ 'index_analyzer' : 'standard', 'equals_behaviour_when_analyzed' : 'MATCH' }" })
+        {
+            createTable("CREATE TABLE %s (pk int PRIMARY KEY, s text, a int, b int)");
+            createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'org.apache.cassandra.index.sasi.SASIIndex' WITH OPTIONS = { 'mode' : 'PREFIX' }");
+            createIndex("CREATE INDEX ON %s(s) USING 'sai' WITH OPTIONS = " + options);
+            createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+            createIndex("CREATE INDEX ON %s(b) USING 'sai'");
+
+            execute("INSERT INTO %s (pk, s, a, b) VALUES (1, 'abc', 1, 9)");
+            execute("INSERT INTO %s (pk, s, a, b) VALUES (2, 'ABC', 1, 9)");
+            execute("INSERT INTO %s (pk, s, a, b) VALUES (3, 'xabcx', 1, 9)");
+            execute("INSERT INTO %s (pk, s, a, b) VALUES (4, 'abc def', 9, 2)");
+            execute("INSERT INTO %s (pk, s, a, b) VALUES (5, 'abc', 9, 9)");
+
+            String query = "SELECT pk FROM %s WHERE s LIKE 'abc' AND (a = 1 OR b = 2) ALLOW FILTERING";
+            beforeAndAfterFlush(() -> {
+                // Control. The SASI index alone
+                assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE s LIKE 'abc'"),
+                                        row(1), row(5));
+
+                assertRowsIgnoringOrder(execute(query),
+                                        row(1));
+                assertEquals(options, ImmutableSet.of(1), executeNet(getDefaultVersion(), ConsistencyLevel.ONE, query).all().stream()
+                                                                                                             .map(fetched -> fetched.getInt("pk"))
+                                                                                                             .collect(Collectors.toSet()));
+            });
+        }
+    }
+
+    @Test
+    public void sasiLikeWithoutWildcardMeansEqualityOnTheFilteringPath() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, s text, a int, x int)");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'org.apache.cassandra.index.sasi.SASIIndex' WITH OPTIONS = { 'mode' : 'PREFIX' }");
+        createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+
+        execute("INSERT INTO %s (pk, s, a, x) VALUES (1, 'abc', 1, 9)");
+        execute("INSERT INTO %s (pk, s, a, x) VALUES (2, 'xabcx', 1, 9)");
+        execute("INSERT INTO %s (pk, s, a, x) VALUES (3, 'abc', 9, 9)");
+
+        // x has no index, so the OR runs on the filtering path
+        String query = "SELECT pk FROM %s WHERE s LIKE 'abc' AND (a = 1 OR x = 2) ALLOW FILTERING";
+        beforeAndAfterFlush(() -> {
+            assertRowsIgnoringOrder(execute(query),
+                                    row(1));
+            assertEquals(ImmutableSet.of(1), executeNet(getDefaultVersion(), ConsistencyLevel.ONE, query).all().stream()
+                                                                                                  .map(fetched -> fetched.getInt("pk"))
+                                                                                                  .collect(Collectors.toSet()));
+        });
+    }
+
+    @Test
+    public void likeNextToDisjunctionNeedsAllowFiltering() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, s text, a int, b int, c text, x int)");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'org.apache.cassandra.index.sasi.SASIIndex' WITH OPTIONS = { 'mode' : 'PREFIX' }");
+        createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(b) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(c) USING 'sai' WITH OPTIONS = { 'case_sensitive' : false }");
+        createIndex("CREATE INDEX ON %s(x) USING 'legacy_local_table'");
+
+        execute("INSERT INTO %s (pk, s, a, b, c, x) VALUES (1, 'abcdef', 1, 9, 'z', 1)");
+        execute("INSERT INTO %s (pk, s, a, b, c, x) VALUES (2, 'zzz', 1, 9, 'z', 9)");
+        execute("INSERT INTO %s (pk, s, a, b, c, x) VALUES (3, 'abcxyz', 9, 2, 'Q', 9)");
+        execute("INSERT INTO %s (pk, s, a, b, c, x) VALUES (4, 'qqq', 9, 2, 'q', 1)");
+        execute("INSERT INTO %s (pk, s, a, b, c, x) VALUES (5, 'abc1', 9, 9, 'z', 1)");
+
+        // A root condition the SAI indexes do not serve needs ALLOW FILTERING, as it does without OR
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
+                             "SELECT pk FROM %s WHERE s LIKE 'abc%%' AND a = 1");
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
+                             "SELECT pk FROM %s WHERE s LIKE 'abc%%' AND (a = 1 OR b = 2)");
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
+                             "SELECT pk FROM %s WHERE s LIKE 'abc%%' AND (a = 1 OR c = 'q')");
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
+                             "SELECT pk FROM %s WHERE x = 1 AND (a = 1 OR b = 2)");
+
+        beforeAndAfterFlush(() -> {
+            // With ALLOW FILTERING the rows are the same
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE s LIKE 'abc%%' AND (a = 1 OR b = 2) ALLOW FILTERING"),
+                                    row(1), row(3));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE s LIKE 'abc%%' AND (a = 1 OR c = 'q') ALLOW FILTERING"),
+                                    row(1), row(3));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE x = 1 AND (a = 1 OR b = 2) ALLOW FILTERING"),
+                                    row(1), row(4));
+
+            // Controls. Conditions the SAI indexes serve need no ALLOW FILTERING
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE a = 1 OR b = 2"),
+                                    row(1), row(2), row(3), row(4));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE a = 1 AND (a = 9 OR b = 2)"));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE a = 9 AND (a = 2 OR b = 2)"),
+                                    row(3), row(4));
+        });
+    }
+
+    @Test
+    public void valueChangingSasiConditionNextToDisjunctionIsRefused() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, s text, a int, b int)");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'org.apache.cassandra.index.sasi.SASIIndex' WITH OPTIONS = " +
+                    "{ 'mode' : 'CONTAINS', 'analyzer_class' : 'org.apache.cassandra.index.sasi.analyzer.NonTokenizingAnalyzer', 'case_sensitive' : 'false' }");
+        createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(b) USING 'sai'");
+
+        execute("INSERT INTO %s (pk, s, a, b) VALUES (1, 'ABCdef', 1, 9)");
+        execute("INSERT INTO %s (pk, s, a, b) VALUES (2, 'abcxyz', 9, 2)");
+        execute("INSERT INTO %s (pk, s, a, b) VALUES (3, 'zzz', 1, 9)");
+
+        // Only the case insensitive SASI index can check the LIKE, and no SASI index runs next to OR
+        assertInvalidMessage("Column s has a SASI index that changes values with its analyzer. A condition on it cannot be " +
+                             "combined with OR, because only that index can check it and that index does not support OR.",
+                             "SELECT pk FROM %s WHERE s LIKE 'ABC%%' AND (a = 1 OR b = 2) ALLOW FILTERING");
+        assertInvalidMessage("Column s has a SASI index that changes values with its analyzer",
+                             "SELECT pk FROM %s WHERE s = 'ABCDEF' AND (a = 1 OR b = 2) ALLOW FILTERING");
+
+        // Guard. Without OR the SASI index answers the LIKE, as Apache Cassandra does
+        beforeAndAfterFlush(() -> {
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE s LIKE 'ABC%%' AND a = 1 ALLOW FILTERING"),
+                                    row(1));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE s LIKE 'ABC%%'"),
+                                    row(1), row(2));
+        });
+
+        // A SASI analyzer that keeps values as they are compares exactly, so its condition is accepted next to OR
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, s text, a int, b int)");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'org.apache.cassandra.index.sasi.SASIIndex' WITH OPTIONS = " +
+                    "{ 'mode' : 'CONTAINS', 'analyzer_class' : 'org.apache.cassandra.index.sasi.analyzer.NonTokenizingAnalyzer', 'case_sensitive' : 'true' }");
+        createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(b) USING 'sai'");
+
+        execute("INSERT INTO %s (pk, s, a, b) VALUES (1, 'ABCdef', 1, 9)");
+        execute("INSERT INTO %s (pk, s, a, b) VALUES (2, 'abcxyz', 9, 2)");
+        execute("INSERT INTO %s (pk, s, a, b) VALUES (3, 'zzz', 1, 9)");
+
+        String exact = "SELECT pk FROM %s WHERE s LIKE 'abc%%' AND (a = 1 OR b = 2) ALLOW FILTERING";
+        beforeAndAfterFlush(() -> {
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE s LIKE 'abc%%'"),
+                                    row(2));
+            assertRowsIgnoringOrder(execute(exact),
+                                    row(2));
+            assertEquals(ImmutableSet.of(2), executeNet(getDefaultVersion(), ConsistencyLevel.ONE, exact).all().stream()
+                                                                                                  .map(fetched -> fetched.getInt("pk"))
+                                                                                                  .collect(Collectors.toSet()));
+        });
+    }
+
+    @Test
+    public void planWithoutDisjunctionKeepsStockPostFilter() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, s text, a int)");
+        String sasiIndex = createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'org.apache.cassandra.index.sasi.SASIIndex' WITH OPTIONS = { 'mode' : 'PREFIX' }");
+        createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+
+        execute("INSERT INTO %s (pk, s, a) VALUES (1, 'abcdef', 1)");
+        execute("INSERT INTO %s (pk, s, a) VALUES (2, 'zzz', 1)");
+        execute("INSERT INTO %s (pk, s, a) VALUES (3, 'abcxyz', 9)");
+
+        // Guard. The SAI plan for a filter without OR drops the LIKE from its post index filter and keeps nothing
+        // to check after the index, as in Apache Cassandra
+        String query = "SELECT pk FROM %s WHERE s LIKE 'abc%%' AND a = 1 ALLOW FILTERING";
+        SelectStatement select = (SelectStatement) QueryProcessor.getStatement(formatQuery(query), ClientState.forInternalCalls());
+        RowFilter filter = ((ReadCommand) select.getQuery(QueryOptions.DEFAULT, FBUtilities.nowInSeconds())).rowFilter();
+        StorageAttachedIndexQueryPlan plan = StorageAttachedIndexGroup.getIndexGroup(getCurrentColumnFamilyStore()).queryPlanFor(filter);
+        assertNotNull(plan);
+        assertTrue(plan.unevaluatedFilter().isEmpty());
+        for (RowFilter.Expression expression : plan.postIndexQueryFilter().getExpressions())
+            assertFalse(expression.toString(), expression.column().name.toString().equals("s"));
+
+        // With the SAI priority flag off the SASI index runs the query
+        boolean prioritize = DatabaseDescriptor.getPrioritizeSAIOverLegacyIndex();
+        try
+        {
+            DatabaseDescriptor.setPrioritizeSAIOverLegacyIndex(false);
+            String trace = getSingleTraceStatement(sessionNet(), query, "Scanning with");
+            assertNotNull(trace);
+            assertTrue(trace, trace.endsWith("Scanning with " + sasiIndex + '.'));
+            assertRowsIgnoringOrder(execute(query),
+                                    row(1));
+        }
+        finally
+        {
+            DatabaseDescriptor.setPrioritizeSAIOverLegacyIndex(prioritize);
+        }
+    }
+
+    @Test
+    public void unevaluatedConditionIsTraced() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, s text, a int, c text)");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'org.apache.cassandra.index.sasi.SASIIndex' WITH OPTIONS = { 'mode' : 'PREFIX' }");
+        createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(c) USING 'sai' WITH OPTIONS = { 'case_sensitive' : false }");
+
+        execute("INSERT INTO %s (pk, s, a, c) VALUES (1, 'abcdef', 1, 'z')");
+        execute("INSERT INTO %s (pk, s, a, c) VALUES (2, 'zzz', 1, 'z')");
+
+        // The coordinator names the condition and column it checks. At RF 1 the filter is strict, so the replica
+        // checks it too.
+        Session session = sessionNet();
+        String query = "SELECT pk FROM %s WHERE s LIKE 'abc%%' AND (a = 1 OR c = 'q') ALLOW FILTERING";
+        String coordinator = getSingleTraceStatement(session, query, "Coordinator checks");
+        assertNotNull(coordinator);
+        assertEquals("Coordinator checks LIKE '<term>%' on column s after merging replica rows, the index cannot evaluate it", coordinator);
+        String replica = getSingleTraceStatement(session, query, "Post index filter checks");
+        assertNotNull(replica);
+        assertEquals("Post index filter checks LIKE '<term>%' on column s, the index cannot evaluate it", replica);
+
+        // Control. A query the index evaluates in full traces neither
+        assertNull(getSingleTraceStatement(session, "SELECT pk FROM %s WHERE a = 1 OR c = 'q'", "Coordinator checks"));
+        assertNull(getSingleTraceStatement(session, "SELECT pk FROM %s WHERE a = 1 OR c = 'q'", "Post index filter checks"));
+    }
+
+    @Test
+    public void valueChangingSasiRefusalIsTraced() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, s text, a int, b int)");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'org.apache.cassandra.index.sasi.SASIIndex' WITH OPTIONS = " +
+                    "{ 'mode' : 'CONTAINS', 'analyzer_class' : 'org.apache.cassandra.index.sasi.analyzer.NonTokenizingAnalyzer', 'case_sensitive' : 'false' }");
+        createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(b) USING 'sai'");
+
+        execute("INSERT INTO %s (pk, s, a, b) VALUES (1, 'ABCdef', 1, 9)");
+
+        // Preparing the refused query traces the refusal and names the column
+        TimeUUID refusedSession = Tracing.instance.newSession(Tracing.TraceType.QUERY);
+        try
+        {
+            assertInvalidMessage("Column s has a SASI index that changes values with its analyzer",
+                                 "SELECT pk FROM %s WHERE s LIKE 'ABC%%' AND (a = 1 OR b = 2) ALLOW FILTERING");
+        }
+        finally
+        {
+            Tracing.instance.stopSession();
+        }
+        waitForTracingEvents();
+
+        List<String> refusals = new ArrayList<>();
+        for (UntypedResultSet.Row event : execute("SELECT activity FROM system_traces.events WHERE session_id = " + refusedSession))
+        {
+            if (event.getString("activity").startsWith("OR query refused"))
+                refusals.add(event.getString("activity"));
+        }
+        assertEquals(List.of("OR query refused: column s is only answered by a SASI index that changes values"), refusals);
+
+        // Control. The same condition without OR is accepted and traces no refusal
+        TimeUUID acceptedSession = Tracing.instance.newSession(Tracing.TraceType.QUERY);
+        try
+        {
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE s LIKE 'ABC%%' AND a = 1 ALLOW FILTERING"), row(1));
+        }
+        finally
+        {
+            Tracing.instance.stopSession();
+        }
+        waitForTracingEvents();
+
+        List<String> acceptedRefusals = new ArrayList<>();
+        for (UntypedResultSet.Row event : execute("SELECT activity FROM system_traces.events WHERE session_id = " + acceptedSession))
+        {
+            if (event.getString("activity").startsWith("OR query refused"))
+                acceptedRefusals.add(event.getString("activity"));
+        }
+        assertEquals(List.of(), acceptedRefusals);
+    }
+
+    @Test
+    public void allowFilteringRequirementIsTraced() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, s text, a int, b int)");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'org.apache.cassandra.index.sasi.SASIIndex' WITH OPTIONS = { 'mode' : 'PREFIX' }");
+        createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(b) USING 'sai'");
+
+        // Preparing the query without ALLOW FILTERING traces the column the SAI indexes do not serve
+        TimeUUID refusedSession = Tracing.instance.newSession(Tracing.TraceType.QUERY);
+        try
+        {
+            assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
+                                 "SELECT pk FROM %s WHERE s LIKE 'abc%%' AND (a = 1 OR b = 2)");
+        }
+        finally
+        {
+            Tracing.instance.stopSession();
+        }
+        waitForTracingEvents();
+
+        Set<String> requirements = new HashSet<>();
+        for (UntypedResultSet.Row event : execute("SELECT activity FROM system_traces.events WHERE session_id = " + refusedSession))
+        {
+            if (event.getString("activity").startsWith("OR query needs ALLOW FILTERING"))
+                requirements.add(event.getString("activity"));
+        }
+        assertEquals(ImmutableSet.of("OR query needs ALLOW FILTERING: column s is not served by the SAI index group"), requirements);
+
+        // Control. A root condition the SAI indexes serve traces nothing
+        TimeUUID servedSession = Tracing.instance.newSession(Tracing.TraceType.QUERY);
+        try
+        {
+            assertEmpty(execute("SELECT pk FROM %s WHERE a = 1 AND (a = 2 OR b = 2)"));
+        }
+        finally
+        {
+            Tracing.instance.stopSession();
+        }
+        waitForTracingEvents();
+
+        Set<String> servedRequirements = new HashSet<>();
+        for (UntypedResultSet.Row event : execute("SELECT activity FROM system_traces.events WHERE session_id = " + servedSession))
+        {
+            if (event.getString("activity").startsWith("OR query needs ALLOW FILTERING"))
+                servedRequirements.add(event.getString("activity"));
+        }
+        assertEquals(ImmutableSet.of(), servedRequirements);
+    }
+
+    @Test
+    public void unevaluatedConditionIsCounted() throws Throwable
+    {
+        startJMXServer();
+        createMBeanServerConnection();
+
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, s text, a int, c text)");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'org.apache.cassandra.index.sasi.SASIIndex' WITH OPTIONS = { 'mode' : 'PREFIX' }");
+        createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(c) USING 'sai' WITH OPTIONS = { 'case_sensitive' : false }");
+
+        execute("INSERT INTO %s (pk, s, a, c) VALUES (1, 'abcdef', 1, 'z')");
+        execute("INSERT INTO %s (pk, s, a, c) VALUES (2, 'zzz', 1, 'z')");
+        execute("INSERT INTO %s (pk, s, a, c) VALUES (3, 'abcxyz', 9, 'Q')");
+        execute("INSERT INTO %s (pk, s, a, c) VALUES (4, 'qqq', 9, 'q')");
+
+        ObjectName checks = objectNameNoIndex("TotalUnevaluatedConditionChecks", KEYSPACE, currentTable(), TableQueryMetrics.TABLE_QUERY_METRIC_TYPE);
+        ObjectName rejected = objectNameNoIndex("TotalRowsRejectedByUnevaluatedCondition", KEYSPACE, currentTable(), TableQueryMetrics.TABLE_QUERY_METRIC_TYPE);
+
+        // One coordinator check. At RF 1 the strict replica filter removed rows 2 and 4, so the check rejects none.
+        executeNet(getDefaultVersion(), ConsistencyLevel.ONE, "SELECT pk FROM %s WHERE s LIKE 'abc%%' AND (a = 1 OR c = 'q') ALLOW FILTERING");
+        assertEquals(1L, getMetricValue(checks));
+        assertEquals(0L, getMetricValue(rejected));
+
+        // Controls. Queries the index evaluates in full, with and without OR, count nothing
+        executeNet(getDefaultVersion(), ConsistencyLevel.ONE, "SELECT pk FROM %s WHERE a = 1 OR c = 'q'");
+        executeNet(getDefaultVersion(), ConsistencyLevel.ONE, "SELECT pk FROM %s WHERE a = 1 AND c = 'q'");
+        assertEquals(1L, getMetricValue(checks));
+        assertEquals(0L, getMetricValue(rejected));
     }
 }

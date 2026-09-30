@@ -297,6 +297,21 @@ ALLOW FILTERING and is evaluated by filtering. There is no cost model for unions
 cut, so very unselective disjunctions can materialize large key sets; the standard SAI
 guardrails still apply per predicate.
 
+A condition next to `OR` on a regular or static column needs ALLOW FILTERING unless a storage-attached
+index serves it, as a query without `OR` does when no one index serves every condition. This covers
+`LIKE` on a column with a SASI index and conditions on a column with a legacy secondary index, so
+`s LIKE 'abc%' AND (a = 1 OR b = 2)` needs ALLOW FILTERING. Above `ONE` such a query also meets the
+`intersect_filtering_query` guardrail, which warns by default.
+
+No SASI index runs for a query with `OR`. The storage-attached indexes find the candidate rows and a
+`LIKE` next to `OR` is checked on them: by the replica when the read waits for one replica, and by the
+coordinator on the merged rows. The check compares the stored value, as a SASI index does when it has no
+analyzer, or has `NonTokenizingAnalyzer` with case sensitivity and no case normalization. A `LIKE`
+without a wildcard means `=`, as it does to such a SASI index, so `s LIKE 'abc'` matches `abc` and not
+`xabcx` or `ABC`, also when a storage-attached index on the same column changes values. A condition that only a SASI index with an analyzer that changes values can answer, like
+`case_sensitive` false, is refused next to `OR` with
+`Column s has a SASI index that changes values with its analyzer. A condition on it cannot be combined with OR, because only that index can check it and that index does not support OR.`
+
 When a read waits for two or more replicas, on the index path and on the filtering path
 alike, the replicas together return every row that could match once their copies are merged,
 and the coordinator filters the merged rows. On the filtering path a replica sends every row that
@@ -386,6 +401,13 @@ With tracing enabled these queries emit events at each decision point:
 * the number of conditions merged on a column of an `OR` group, on each execution
 * on a replica, the column and number of expressions on one column kept apart instead of
   folded into one range
+* each condition next to `OR` that the index cannot evaluate, naming the operator and column, on the
+  coordinator that checks it on the merged rows and on a replica that checks it in its post index filter
+* an `OR` query refused for a condition only a SASI index that changes values can answer, naming the
+  column, when the statement is prepared
+* a condition next to `OR` that the storage-attached indexes do not serve, naming the column, each
+  time the statement is checked for filtering: when it is prepared without ALLOW FILTERING, and when
+  it runs above `ONE` and the intersect filtering guardrail is checked
 
 ## Metrics
 
@@ -398,6 +420,15 @@ and each range split is one command. It stays 0 while every coordinator merges t
 `OR` group, and a nonzero value means a coordinator sent such conditions unmerged, see
 [Cluster upgrade rule](#cluster-upgrade-rule). To read it:
 `nodetool sjk mx -mg -b "org.apache.cassandra.metrics:type=StorageAttachedIndex,keyspace=ks,table=t,scope=TableQueryMetrics,name=TotalSameColumnExpressionsKeptApart" -f Count`.
+
+`TotalUnevaluatedConditionChecks` and `TotalRowsRejectedByUnevaluatedCondition` are counters in the same
+`TableQueryMetrics` scope, on the coordinator. The first counts checks of conditions next to `OR` that the
+index cannot evaluate, such as a SASI `LIKE`, one per resolve of replica responses, so one per page and
+per range split. The second counts the merged rows those checks removed. With no analyzer in the query
+the check runs first on the merged rows, so it counts every merged row that fails the condition. With an
+analyzer in the query it runs after the filter tree check, so it counts only rows that passed the other
+conditions. A replica that checks such a condition in its post index filter counts nothing here. Both
+read as `TotalSameColumnExpressionsKeptApart` does.
 
 ## Not yet available
 

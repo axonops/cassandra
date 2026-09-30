@@ -90,6 +90,10 @@ public final class StatementRestrictions
 
     public static final String MAP_KEYS_OPERATOR_REQUIRES_INDEX_MESSAGE = "%s needs an index with an index_analyzer on KEYS(%s).";
 
+    public static final String VALUE_CHANGING_SASI_NEXT_TO_OR_MESSAGE =
+        "Column %s has a SASI index that changes values with its analyzer. A condition on it cannot be combined with OR, " +
+        "because only that index can check it and that index does not support OR.";
+
     /**
      * The type of statement
      */
@@ -434,6 +438,10 @@ public final class StatementRestrictions
             if (partitionKeyRestrictions.hasIN())
                 throw invalidRequest("IN restrictions on the partition key are not supported in queries containing OR");
 
+            // No SASI index runs next to OR, and a root condition only a SASI index that changes values can
+            // answer gives different rows when compared with the stored value
+            checkRootIsNotOnlyServedByValueChangingSasi(indexRegistry);
+
             // A disjunct can match rows in any partition, so the query is always a range read.
             // Cut 1 does not optimize a partition restricted query with a disjunction into a
             // slice read even though it could.
@@ -631,6 +639,98 @@ public final class StatementRestrictions
         }
 
         return (SingleRestriction) restriction;
+    }
+
+    /**
+     * Refuses a root condition on a regular or static column when every index group that serves it is a SASI
+     * index whose analyzer changes values. Such a condition sits next to OR, where no SASI index runs.
+     */
+    private void checkRootIsNotOnlyServedByValueChangingSasi(IndexRegistry indexRegistry)
+    {
+        if (indexRegistry == null)
+            return;
+
+        for (SingleRestriction restriction : nonPrimaryKeyRestrictions)
+        {
+            boolean servedByValueChangingSasi = false;
+            boolean servedOtherwise = false;
+            for (Index.Group group : indexRegistry.listIndexGroups())
+            {
+                if (restriction.needsFiltering(group))
+                    continue;
+
+                if (Iterables.all(group.getIndexes(), StorageAttachedIndex::sasiIndexChangesValues))
+                    servedByValueChangingSasi = true;
+                else
+                    servedOtherwise = true;
+            }
+
+            if (servedByValueChangingSasi && !servedOtherwise)
+            {
+                ColumnMetadata column = restriction.getFirstColumn();
+                Tracing.trace("OR query refused: column {} is only answered by a SASI index that changes values", column.name);
+                throw invalidRequest(VALUE_CHANGING_SASI_NEXT_TO_OR_MESSAGE, column.name);
+            }
+        }
+    }
+
+    /**
+     * @return true when the query has disjunctions and some root condition on a regular or static column is not
+     * served by any index group that can execute disjunctions. The query then filters, as a query without OR
+     * does when no one index group serves every condition. The caller returns earlier when the disjunctions
+     * themselves need filtering.
+     */
+    private boolean rootNeedsFilteringNextToDisjunctions(IndexRegistry indexRegistry)
+    {
+        if (disjunctions.isEmpty())
+            return false;
+
+        for (SingleRestriction restriction : nonPrimaryKeyRestrictions)
+        {
+            boolean served = false;
+            for (Index.Group group : indexRegistry.listIndexGroups())
+            {
+                if (group.supportsDisjunction() && !restriction.needsFiltering(group))
+                {
+                    served = true;
+                    break;
+                }
+            }
+            if (!served)
+            {
+                Tracing.trace("OR query needs ALLOW FILTERING: column {} is not served by the SAI index group", restriction.getFirstColumn().name);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * A copy of the root expressions of the filter with a LIKE without a wildcard as =. That is what it means to a
+     * SASI index that keeps values as they are, and next to OR no SASI index runs. On the index path a LIKE on a
+     * column with an SAI index stays a LIKE, since that index answers = with its own meaning. The SAI query
+     * plan checks it as a raw = on the candidate rows instead.
+     */
+    private RowFilter withLikeMatchesAsEquality(RowFilter filter, boolean needsReconciliation, IndexRegistry indexRegistry)
+    {
+        boolean indexPath = !disjunctionsNeedFiltering && disjunctionsAreIndexSupported(indexRegistry);
+        RowFilter rewritten = RowFilter.create(needsReconciliation);
+        for (RowFilter.Expression expression : filter.root().expressions())
+        {
+            if (expression.operator() == Operator.LIKE_MATCHES && !(indexPath && hasStorageAttachedIndex(indexRegistry, expression.column())))
+                rewritten.add(expression.column(), Operator.EQ, expression.getIndexValue());
+            else
+                rewritten.root().add(expression);
+        }
+        return rewritten;
+    }
+
+    private static boolean hasStorageAttachedIndex(IndexRegistry indexRegistry, ColumnMetadata column)
+    {
+        for (Index index : indexRegistry.listIndexes())
+            if (index instanceof StorageAttachedIndex && index.dependsOn(column))
+                return true;
+        return false;
     }
 
     /**
@@ -1104,6 +1204,10 @@ public final class StatementRestrictions
         for (CustomIndexExpression expression : filterRestrictions.getCustomIndexExpressions())
             expression.addToRowFilter(filter, table, options);
 
+        // Only a root LIKE without a wildcard is rewritten, a LIKE inside OR is refused when prepared
+        if (!disjunctions.isEmpty())
+            filter = withLikeMatchesAsEquality(filter, needsReconciliation, indexRegistry);
+
         // Each disjunction becomes an OR child of the root. This is a structural mapping of the
         // WHERE clause subtree, one AST node to one filter node, with no operator rewriting.
         for (DisjunctionHolder holder : disjunctions)
@@ -1369,6 +1473,9 @@ public final class StatementRestrictions
             return true;
 
         IndexRegistry indexRegistry = IndexRegistry.obtain(table);
+        if (rootNeedsFilteringNextToDisjunctions(indexRegistry))
+            return true;
+
         if (filterRestrictions.needsFiltering(indexRegistry))
             return true;
 

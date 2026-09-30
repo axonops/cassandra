@@ -27,6 +27,7 @@ import javax.annotation.Nullable;
 import com.google.common.collect.ImmutableSet;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.ReadCommand;
 import org.apache.cassandra.db.filter.RowFilter;
@@ -48,6 +49,8 @@ public class StorageAttachedIndexQueryPlan implements Index.QueryPlan
     private final RowFilter indexFilter;
     private final Set<Index> indexes;
     private final boolean isTopK;
+    // Root conditions of a filter with OR that the index cannot evaluate, checked on the candidate rows
+    private final RowFilter unevaluatedFilter;
 
     private StorageAttachedIndexQueryPlan(ColumnFamilyStore cfs,
                                           TableQueryMetrics queryMetrics,
@@ -61,6 +64,23 @@ public class StorageAttachedIndexQueryPlan implements Index.QueryPlan
         this.indexFilter = indexFilter;
         this.indexes = indexes;
         this.isTopK = indexes.stream().anyMatch(i -> i instanceof StorageAttachedIndex && ((StorageAttachedIndex) i).termType().isVector());
+        this.unevaluatedFilter = RowFilter.none();
+    }
+
+    private StorageAttachedIndexQueryPlan(ColumnFamilyStore cfs,
+                                          TableQueryMetrics queryMetrics,
+                                          RowFilter postIndexFilter,
+                                          RowFilter indexFilter,
+                                          ImmutableSet<Index> indexes,
+                                          RowFilter unevaluatedFilter)
+    {
+        this.cfs = cfs;
+        this.queryMetrics = queryMetrics;
+        this.postIndexFilter = postIndexFilter;
+        this.indexFilter = indexFilter;
+        this.indexes = indexes;
+        this.isTopK = indexes.stream().anyMatch(i -> i instanceof StorageAttachedIndex && ((StorageAttachedIndex) i).termType().isVector());
+        this.unevaluatedFilter = unevaluatedFilter;
     }
 
     @Nullable
@@ -73,9 +93,40 @@ public class StorageAttachedIndexQueryPlan implements Index.QueryPlan
 
         RowFilter preIndexFilter = filter;
         RowFilter postIndexFilter = filter;
+        RowFilter unevaluated = null;
 
         for (RowFilter.Expression expression : filter.root().expressions())
         {
+            // Next to OR no other index runs, so a root condition this index cannot evaluate, like a LIKE
+            // that only a SASI index serves, is checked on the candidate rows. A replica checks it in the
+            // post index filter when the filter is strict. The coordinator always checks it on the merged
+            // rows, since a row may match only once the replicas' copies are merged.
+            if (filter.containsDisjunction() && !Expression.supportsOperator(expression.operator())
+                && !expression.operator().isIN() && !expression.isUserDefined())
+            {
+                if (unevaluated == null)
+                    unevaluated = RowFilter.create(filter.needsReconciliation());
+
+                boolean inPostIndexFilter = postIndexFilter.root().expressions().contains(expression);
+                boolean likeMatches = expression.operator() == Operator.LIKE_MATCHES;
+                if (inPostIndexFilter && (!filter.isStrict() || likeMatches))
+                    postIndexFilter = postIndexFilter.without(expression);
+
+                // A LIKE without a wildcard reaches here only for a column with an SAI index, see
+                // StatementRestrictions.getRowFilter. It means exact equality, so it is checked as a raw =.
+                if (likeMatches)
+                {
+                    RowFilter.SimpleExpression equality = unevaluated.add(expression.column(), Operator.EQ, expression.getIndexValue());
+                    if (inPostIndexFilter && filter.isStrict())
+                        postIndexFilter.root().add(equality);
+                }
+                else
+                {
+                    unevaluated.root().add(expression);
+                }
+                continue;
+            }
+
             // We ignore any expressions here (currently IN and user-defined expressions) where we don't have a way to
             // translate their #isSatifiedBy method, they will be included in the filter returned by
             // QueryPlan#postIndexQueryFilter(). If strict filtering is not allowed, we must reject the query until the
@@ -136,6 +187,9 @@ public class StorageAttachedIndexQueryPlan implements Index.QueryPlan
         if (selectedIndexes.isEmpty())
             return null;
 
+        if (unevaluated != null)
+            return new StorageAttachedIndexQueryPlan(cfs, queryMetrics, postIndexFilter, preIndexFilter, selectedIndexes, unevaluated);
+
         return new StorageAttachedIndexQueryPlan(cfs, queryMetrics, postIndexFilter, preIndexFilter, selectedIndexes);
     }
 
@@ -195,5 +249,14 @@ public class StorageAttachedIndexQueryPlan implements Index.QueryPlan
     public boolean isTopK()
     {
         return isTopK;
+    }
+
+    /**
+     * @return the root conditions of a filter with OR that the index cannot evaluate, which the coordinator
+     * checks on the merged rows, or an empty filter
+     */
+    public RowFilter unevaluatedFilter()
+    {
+        return unevaluatedFilter;
     }
 }

@@ -55,12 +55,14 @@ import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
 import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.partitions.PartitionIterators;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.AbstractUnfilteredRowIterator;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.RowIterator;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.RequestTimeoutException;
@@ -156,16 +158,90 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             {
                 PartitionIterator filtered = applyIndexFilter(fullResponse, Operation.buildFilter(queryController, true), queryContext);
                 RowFilter postIndexFilter = command.indexQueryPlan().postIndexQueryFilter();
-                return postIndexFilter.filter(filtered, command.metadata(), command.nowInSec());
+                return applyUnevaluatedFilter(postIndexFilter.filter(filtered, command.metadata(), command.nowInSec()));
             }
         }
 
-        return Index.Searcher.super.filterReplicaFilteringProtection(fullResponse);
+        return Index.Searcher.super.filterReplicaFilteringProtection(applyUnevaluatedFilter(fullResponse));
+    }
+
+    /**
+     * Checks the merged rows against the root conditions of a filter with OR that the index cannot evaluate,
+     * and counts the check and the rows it removes.
+     */
+    private PartitionIterator applyUnevaluatedFilter(PartitionIterator merged)
+    {
+        if (!(command.indexQueryPlan() instanceof StorageAttachedIndexQueryPlan))
+            return merged;
+
+        RowFilter unevaluated = ((StorageAttachedIndexQueryPlan) command.indexQueryPlan()).unevaluatedFilter();
+        if (unevaluated.isEmpty())
+            return merged;
+
+        if (Tracing.isTracing())
+        {
+            for (RowFilter.Expression expression : unevaluated.root().expressions())
+                Tracing.trace("Coordinator checks {} on column {} after merging replica rows, the index cannot evaluate it",
+                              expression.operator(), expression.column().name);
+        }
+
+        if (tableQueryMetrics != null)
+            tableQueryMetrics.totalUnevaluatedConditionChecks.inc();
+
+        RowCounter checked = new RowCounter();
+        RowCounter kept = new RowCounter();
+        PartitionIterator filtered = unevaluated.filter(Transformation.apply(merged, checked), command.metadata(), command.nowInSec());
+        return PartitionIterators.doOnClose(Transformation.apply(filtered, kept), () -> {
+            if (tableQueryMetrics != null)
+                tableQueryMetrics.totalRowsRejectedByUnevaluatedCondition.inc(checked.rows - kept.rows);
+        });
+    }
+
+    /**
+     * Traces each root condition of a filter with OR that the index cannot evaluate and that this replica checks
+     * in the post index filter, which holds them when the filter is strict.
+     */
+    private void traceUnevaluatedOnReplica()
+    {
+        if (!(command.indexQueryPlan() instanceof StorageAttachedIndexQueryPlan))
+            return;
+
+        StorageAttachedIndexQueryPlan plan = (StorageAttachedIndexQueryPlan) command.indexQueryPlan();
+        for (RowFilter.Expression expression : plan.unevaluatedFilter().root().expressions())
+        {
+            if (plan.postIndexQueryFilter().root().expressions().contains(expression))
+                Tracing.trace("Post index filter checks {} on column {}, the index cannot evaluate it",
+                              expression.operator(), expression.column().name);
+        }
+    }
+
+    /**
+     * Counts the rows that pass through it.
+     */
+    private static final class RowCounter extends Transformation<RowIterator>
+    {
+        private long rows;
+
+        @Override
+        protected RowIterator applyToPartition(RowIterator partition)
+        {
+            return Transformation.apply(partition, this);
+        }
+
+        @Override
+        protected Row applyToRow(Row row)
+        {
+            rows++;
+            return row;
+        }
     }
 
     @Override
     public UnfilteredPartitionIterator search(ReadExecutionController executionController) throws RequestTimeoutException
     {
+        if (Tracing.isTracing())
+            traceUnevaluatedOnReplica();
+
         if (!command.isTopK())
         {
             return new ResultRetriever(executionController);

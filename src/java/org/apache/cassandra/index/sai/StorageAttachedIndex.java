@@ -69,7 +69,9 @@ import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.db.guardrails.MaxThreshold;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.marshal.FloatType;
+import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.rows.Row;
@@ -102,6 +104,11 @@ import org.apache.cassandra.index.sai.utils.IndexTermType;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.index.sai.view.IndexViewManager;
 import org.apache.cassandra.index.sai.view.View;
+import org.apache.cassandra.index.sasi.SASIIndex;
+import org.apache.cassandra.index.sasi.analyzer.NoOpAnalyzer;
+import org.apache.cassandra.index.sasi.analyzer.NonTokenizingAnalyzer;
+import org.apache.cassandra.index.sasi.conf.ColumnIndex;
+import org.apache.cassandra.index.sasi.conf.IndexMode;
 import org.apache.cassandra.index.transactions.IndexTransaction;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
@@ -761,6 +768,42 @@ public class StorageAttachedIndex implements Index
     public boolean hasLuceneAnalyzer()
     {
         return luceneIndexAnalyzer != null;
+    }
+
+    /**
+     * Whether a SASI index compares analyzed values rather than the stored values: its mode is analyzed and its
+     * analyzer is not the identity. NoOpAnalyzer is the identity, and so is NonTokenizingAnalyzer while it stays
+     * case sensitive and does not normalize case. An analyzed mode with no analyzer class on a text column uses
+     * StandardAnalyzer. Any other analyzer class counts as changing values.
+     *
+     * @return true when the index is a SASI index whose analyzer changes values
+     */
+    public static boolean sasiIndexChangesValues(Index index)
+    {
+        if (!(index instanceof SASIIndex))
+            return false;
+
+        ColumnIndex columnIndex = ((SASIIndex) index).getIndex();
+        IndexMode mode = columnIndex.getMode();
+        if (!mode.isAnalyzed)
+            return false;
+
+        if (mode.analyzerClass == null)
+            return columnIndex.getValidator() instanceof UTF8Type || columnIndex.getValidator() instanceof AsciiType;
+
+        if (mode.analyzerClass == NoOpAnalyzer.class)
+            return false;
+
+        if (mode.analyzerClass == NonTokenizingAnalyzer.class)
+        {
+            Map<String, String> options = index.getIndexMetadata().options;
+            String caseSensitive = options.get(org.apache.cassandra.index.sasi.analyzer.NonTokenizingOptions.CASE_SENSITIVE);
+            return (caseSensitive != null && !Boolean.parseBoolean(caseSensitive))
+                   || Boolean.parseBoolean(options.get(org.apache.cassandra.index.sasi.analyzer.NonTokenizingOptions.NORMALIZE_LOWERCASE))
+                   || Boolean.parseBoolean(options.get(org.apache.cassandra.index.sasi.analyzer.NonTokenizingOptions.NORMALIZE_UPPERCASE));
+        }
+
+        return true;
     }
 
     public LuceneTextAnalyzer luceneIndexAnalyzer()

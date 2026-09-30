@@ -44,6 +44,10 @@ public class TableQueryMetrics extends AbstractMetrics
     // Operation.buildIndexExpressionsKeptApart. Stays 0 while every coordinator merges the relations
     // of an OR branch.
     private final Counter totalSameColumnExpressionsKeptApart;
+    // Coordinator checks of root conditions next to OR that the index cannot evaluate, one per resolve of
+    // replica responses, and the merged rows those checks removed
+    public final Counter totalUnevaluatedConditionChecks;
+    public final Counter totalRowsRejectedByUnevaluatedCondition;
 
     public TableQueryMetrics(TableMetadata table)
     {
@@ -58,6 +62,8 @@ public class TableQueryMetrics extends AbstractMetrics
         totalQueriesCompleted = Metrics.counter(createMetricName("TotalQueriesCompleted"));
         totalQueryTimeouts = Metrics.counter(createMetricName("TotalQueryTimeouts"));
         totalSameColumnExpressionsKeptApart = Metrics.counter(createMetricName("TotalSameColumnExpressionsKeptApart"));
+        totalUnevaluatedConditionChecks = Metrics.counter(createMetricName("TotalUnevaluatedConditionChecks"));
+        totalRowsRejectedByUnevaluatedCondition = Metrics.counter(createMetricName("TotalRowsRejectedByUnevaluatedCondition"));
     }
 
     public void record(QueryContext queryContext)

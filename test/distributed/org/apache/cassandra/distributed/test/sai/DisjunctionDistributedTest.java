@@ -56,7 +56,7 @@ import static org.apache.cassandra.distributed.shared.AssertUtils.row;
  * dropping stale local matches, analyzed leaves inside disjunctions, the cluster version
  * gate refusing OR while a peer speaks the vanilla messaging version, and several relations on
  * one column inside one OR branch: a pair refused at every consistency level and a merged slice
- * over rows split across replicas.
+ * over rows split across replicas. A SASI LIKE next to OR is checked on the merged rows.
  */
 public class DisjunctionDistributedTest extends TestBaseImpl
 {
@@ -72,6 +72,7 @@ public class DisjunctionDistributedTest extends TestBaseImpl
         CLUSTER = init(Cluster.build(NODES)
                               .withConfig(config -> config.set("hinted_handoff_enabled", false)
                                                           .set("storage_compatibility_mode", "NONE")
+                                                          .set("sasi_indexes_enabled", true)
                                                           .with(GOSSIP).with(NETWORK))
                               .start(),
                        NODES);
@@ -680,6 +681,105 @@ public class DisjunctionDistributedTest extends TestBaseImpl
         String query = "SELECT ck FROM %s.merged_slice WHERE (a > 0 AND a < 3 AND b = 7) OR c = 'q'";
         assertEquals(ImmutableSet.of(0, 1, 2), valuesAt(query, ConsistencyLevel.ALL));
         assertEquals(1, CLUSTER.coordinator(1).execute(withKeyspace(query), ConsistencyLevel.QUORUM).length);
+    }
+
+    @Test
+    public void sasiLikeNextToDisjunctionAtEveryConsistency()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.sasi_like (pk int PRIMARY KEY, s text, a int, b int, c text) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE CUSTOM INDEX sasi_like_s_idx ON %s.sasi_like(s) USING 'org.apache.cassandra.index.sasi.SASIIndex' " +
+                                          "WITH OPTIONS = { 'mode' : 'PREFIX' }"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX sasi_like_a_idx ON %s.sasi_like(a) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX sasi_like_b_idx ON %s.sasi_like(b) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX sasi_like_c_idx ON %s.sasi_like(c) USING 'sai' WITH OPTIONS = { 'case_sensitive' : false }"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        Object[][] rows = { { 1, "abcdef", 1, 9, "z" },
+                            { 2, "zzz", 1, 9, "z" },
+                            { 3, "abcxyz", 9, 2, "Q" },
+                            { 4, "qqq", 9, 2, "q" },
+                            { 5, "abc1", 9, 9, "z" },
+                            { 6, "qqq", 9, 9, "z" } };
+        for (Object[] row : rows)
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.sasi_like (pk, s, a, b, c) VALUES (?, ?, ?, ?, ?)"), ConsistencyLevel.ALL, row);
+
+        String analyzed = "SELECT pk FROM %s.sasi_like WHERE s LIKE 'abc%%' AND (a = 1 OR c = 'q') ALLOW FILTERING";
+        String plain = "SELECT pk FROM %s.sasi_like WHERE s LIKE 'abc%%' AND (a = 1 OR b = 2) ALLOW FILTERING";
+        String checks = "org.apache.cassandra.metrics.StorageAttachedIndex.TotalUnevaluatedConditionChecks." + KEYSPACE + ".sasi_like.TableQueryMetrics";
+        String rejected = "org.apache.cassandra.metrics.StorageAttachedIndex.TotalRowsRejectedByUnevaluatedCondition." + KEYSPACE + ".sasi_like.TableQueryMetrics";
+        for (ConsistencyLevel cl : new ConsistencyLevel[]{ ConsistencyLevel.ONE, ConsistencyLevel.QUORUM, ConsistencyLevel.ALL })
+        {
+            long checksBefore = CLUSTER.get(1).metrics().getCounter(checks);
+            long rejectedBefore = CLUSTER.get(1).metrics().getCounter(rejected);
+            assertEquals(cl.name(), ImmutableSet.of(1, 3), valuesAt(analyzed, cl));
+
+            // At ONE the replica filter is strict and removes rows 2 and 4. Above ONE the replicas send them and
+            // the coordinator check removes them from the merged rows.
+            assertTrue(cl.name(), CLUSTER.get(1).metrics().getCounter(checks) > checksBefore);
+            assertEquals(cl.name(), cl == ConsistencyLevel.ONE ? 0 : 2, CLUSTER.get(1).metrics().getCounter(rejected) - rejectedBefore);
+
+            // Guard. The plain OR rows, which the stock check of the whole row filter keeps exact too
+            long plainRejectedBefore = CLUSTER.get(1).metrics().getCounter(rejected);
+            assertEquals(cl.name(), ImmutableSet.of(1, 3), valuesAt(plain, cl));
+            // The coordinator check runs before that stock check, so above ONE it removes rows 2 and 4 here too
+            assertEquals(cl.name(), cl == ConsistencyLevel.ONE ? 0 : 2, CLUSTER.get(1).metrics().getCounter(rejected) - plainRejectedBefore);
+        }
+    }
+
+    @Test
+    public void sasiLikeNextToDisjunctionKeepsSplitRows()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.sasi_split (pk int, ck int, s text, a int, b int, c text, PRIMARY KEY (pk, ck)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE CUSTOM INDEX sasi_split_s_idx ON %s.sasi_split(s) USING 'org.apache.cassandra.index.sasi.SASIIndex' " +
+                                          "WITH OPTIONS = { 'mode' : 'PREFIX' }"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX sasi_split_a_idx ON %s.sasi_split(a) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX sasi_split_b_idx ON %s.sasi_split(b) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX sasi_split_c_idx ON %s.sasi_split(c) USING 'sai' WITH OPTIONS = { 'case_sensitive' : false }"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        // One partition, rows split across a different pair of nodes each, as in disjunctionsSplitAcrossReplicas.
+        // ck 0 to 2 hold the latest s = 'abcxyz' on one node and the latest a = 1 on the next, so the node
+        // matching the OR holds s = 'zzz'. ck 10 has the latest a = 1 on node 1 and s = 'zzz' on every node.
+        for (int ck : new int[]{ 0, 1, 2, 10 })
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.sasi_split (pk, ck, s, a, b, c) VALUES (0, ?, 'zzz', 9, 9, 'z') USING TIMESTAMP 1"),
+                                           ConsistencyLevel.ALL, ck);
+        for (int ck = 0; ck <= 2; ck++)
+        {
+            CLUSTER.get(ck + 1).executeInternal(withKeyspace("UPDATE %s.sasi_split USING TIMESTAMP 2 SET s = 'abcxyz' WHERE pk = 0 AND ck = ?"), ck);
+            CLUSTER.get((ck + 1) % NODES + 1).executeInternal(withKeyspace("UPDATE %s.sasi_split USING TIMESTAMP 2 SET a = 1 WHERE pk = 0 AND ck = ?"), ck);
+        }
+        CLUSTER.get(1).executeInternal(withKeyspace("UPDATE %s.sasi_split USING TIMESTAMP 2 SET a = 1 WHERE pk = 0 AND ck = 10"));
+
+        // Whatever pair QUORUM contacts, exactly one row has both halves inside it. The first query, the plain OR, is a
+        // guard, since the stock check of the whole row filter keeps it exact too.
+        for (String query : new String[]{ "SELECT ck FROM %s.sasi_split WHERE s LIKE 'abc%%' AND (a = 1 OR b = 2) ALLOW FILTERING",
+                                          "SELECT ck FROM %s.sasi_split WHERE s LIKE 'abc%%' AND (a = 1 OR c = 'q') ALLOW FILTERING" })
+        {
+            assertEquals(query, ImmutableSet.of(0, 1, 2), valuesAt(query, ConsistencyLevel.ALL));
+            assertEquals(query, 1, CLUSTER.coordinator(1).execute(withKeyspace(query), ConsistencyLevel.QUORUM).length);
+        }
+    }
+
+    @Test
+    public void sasiLikeWithoutWildcardAtEveryConsistency()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.sasi_exact (pk int PRIMARY KEY, s text, a int, b int, x int) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE CUSTOM INDEX sasi_exact_s_idx ON %s.sasi_exact(s) USING 'org.apache.cassandra.index.sasi.SASIIndex' " +
+                                          "WITH OPTIONS = { 'mode' : 'PREFIX' }"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX sasi_exact_a_idx ON %s.sasi_exact(a) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX sasi_exact_b_idx ON %s.sasi_exact(b) USING 'sai'"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.sasi_exact (pk, s, a, b, x) VALUES (1, 'abc', 1, 9, 9)"), ConsistencyLevel.ALL);
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.sasi_exact (pk, s, a, b, x) VALUES (2, 'xabcx', 1, 9, 9)"), ConsistencyLevel.ALL);
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.sasi_exact (pk, s, a, b, x) VALUES (3, 'abc', 9, 9, 9)"), ConsistencyLevel.ALL);
+
+        // A LIKE without a wildcard means equality, on the filtering path and on the index path
+        for (ConsistencyLevel cl : new ConsistencyLevel[]{ ConsistencyLevel.ONE, ConsistencyLevel.QUORUM, ConsistencyLevel.ALL })
+        {
+            assertEquals(cl.name(), ImmutableSet.of(1), valuesAt("SELECT pk FROM %s.sasi_exact WHERE s LIKE 'abc' AND (a = 1 OR x = 2) ALLOW FILTERING", cl));
+            assertEquals(cl.name(), ImmutableSet.of(1), valuesAt("SELECT pk FROM %s.sasi_exact WHERE s LIKE 'abc' AND (a = 1 OR b = 2) ALLOW FILTERING", cl));
+        }
     }
 
     private static void setPeerVersionOnNode1(int peer, int version)
